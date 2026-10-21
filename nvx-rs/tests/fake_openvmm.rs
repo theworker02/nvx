@@ -8,6 +8,7 @@
 
 use std::fs;
 use std::path::Path;
+use std::process::{Command, Stdio};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::thread;
@@ -15,8 +16,10 @@ use std::time::Duration;
 
 use nvx::host::instance::{self, Instance, WorkloadOutcome};
 use nvx::host::launch::{LaunchSpec, PROCESS_COMMAND_LINE_LIMIT};
+use nvx::host::sandbox::mount::aggregate_child_name;
 use nvx::protocol::{Workload, WorkloadEnvironment};
 use nvx::{Artifacts, ErrorKind, Hypervisor};
+use serde_json::{Value, json};
 
 const TIMEOUT: Duration = Duration::from_secs(30);
 
@@ -240,4 +243,185 @@ fn launches_that_exit_fail_to_start() {
         "{error}"
     );
     assert_eq!(instance.reconcile().unwrap(), None);
+}
+
+/// Runs the fake in `directory` as `nvx.py run` runs OpenVMM on the terminal: with two
+/// processors and the backend of this host, and then `arguments`.
+fn run_microvm(directory: &Path, arguments: &[&str]) -> std::process::Output {
+    let hypervisor = Hypervisor::platform_default().expect("tests run on Linux or Windows");
+    Command::new(env!("CARGO_BIN_EXE_nvx-fake-openvmm"))
+        .args([
+            "--single-process",
+            "--machine",
+            "microvm",
+            "--processors",
+            "2",
+        ])
+        .args(["--hypervisor", hypervisor.as_str()])
+        .args(arguments)
+        .current_dir(directory)
+        .stdin(Stdio::null())
+        .output()
+        .unwrap()
+}
+
+fn text(data: &[u8]) -> String {
+    String::from_utf8_lossy(data).into_owned()
+}
+
+#[test]
+fn runs_boot_or_restore_a_microvm_on_the_terminal() {
+    let directory = tempfile::tempdir().unwrap();
+    let root = directory.path();
+    let path = |name: &str| root.join(name).to_str().unwrap().to_owned();
+    fs::write(root.join("vmlinux"), b"kernel").unwrap();
+    fs::write(root.join("initramfs.cpio.gz"), b"initrd").unwrap();
+    fs::create_dir(root.join("reports")).unwrap();
+    fs::create_dir(root.join("snapshot")).unwrap();
+    let (kernel, initrd) = (path("vmlinux"), path("initramfs.cpio.gz"));
+    let boot = ["--memory", "128M", "--kernel", &kernel, "--initrd", &initrd];
+
+    // A cold boot prints that it booted, writes its outcome report, records its command line next
+    // to the kernel, and exits with 0.
+    let report = root.join("reports").join("boot.json");
+    let report_path = report.to_str().unwrap().to_owned();
+    let mut arguments = boot.to_vec();
+    arguments.extend(["--cpu-profile", "host", "--microvm-report", &report_path]);
+    let output = run_microvm(root, &arguments);
+    assert_eq!(output.status.code(), Some(0), "{}", text(&output.stderr));
+    assert_eq!(
+        text(&output.stdout),
+        "nvx-fake-openvmm: booted the microVM\n"
+    );
+    assert_eq!(text(&output.stderr), "");
+    let document: Value = serde_json::from_str(&fs::read_to_string(&report).unwrap()).unwrap();
+    assert_eq!(
+        document["outcome"],
+        json!({"operation": "run", "category": "success", "status_code": 0})
+    );
+    assert_eq!(document["network_policy"]["status"], "not-requested");
+    let recorded: Vec<String> =
+        serde_json::from_str(&fs::read_to_string(root.join("fake-openvmm-reports.json")).unwrap())
+            .unwrap();
+    assert_eq!(recorded[recorded.len() - 1], report_path);
+
+    // The kernel command line sets the status, also of a restore, which prints that it restored
+    // the snapshot and records its command line next to it.
+    let mut arguments = boot.to_vec();
+    arguments.extend(["--cmdline", "quiet fake_exit_status=5"]);
+    let output = run_microvm(root, &arguments);
+    assert_eq!(output.status.code(), Some(5), "{}", text(&output.stderr));
+    let snapshot = path("snapshot");
+    let restore = [
+        "--restore-snapshot",
+        &snapshot,
+        "--restore-processors",
+        "1",
+        "--cmdline",
+        "fake_exit_status=6",
+    ];
+    fs::remove_file(root.join("fake-openvmm-.json")).unwrap();
+    let output = run_microvm(root, &restore);
+    assert_eq!(output.status.code(), Some(6), "{}", text(&output.stderr));
+    assert_eq!(
+        text(&output.stdout),
+        "nvx-fake-openvmm: restored the microVM\n"
+    );
+    let recorded: Vec<String> =
+        serde_json::from_str(&fs::read_to_string(root.join("fake-openvmm-.json")).unwrap())
+            .unwrap();
+    assert_eq!(recorded[recorded.len() - restore.len()..], restore);
+
+    // A restore without its snapshot fails as OpenVMM fails it, and OpenVMM refuses a command
+    // line that it does not take with status 2.
+    let missing = path("missing");
+    let output = run_microvm(root, &["--restore-snapshot", &missing]);
+    assert_eq!(output.status.code(), Some(1));
+    assert_eq!(text(&output.stdout), "");
+    assert_eq!(
+        text(&output.stderr),
+        format!("nvx-fake-openvmm: cannot restore {missing}: no such snapshot directory\n")
+    );
+    let output = run_microvm(root, &["--restore-snapshot", &snapshot, "--memory", "128M"]);
+    assert_eq!(output.status.code(), Some(2));
+    assert_eq!(
+        text(&output.stderr),
+        "nvx-fake-openvmm: a restore takes no --memory\n"
+    );
+}
+
+#[test]
+fn runs_find_absolute_policy_paths_in_relative_share_roots() {
+    // nvx.py run and nvx-rs run pass the host path of each share as given, which may be relative
+    // to the working directory, and with several shares, absolute policy paths, which OpenVMM
+    // attributes to the share whose root contains them once it has resolved both.
+    let directory = tempfile::tempdir().unwrap();
+    let root = directory.path();
+    fs::write(root.join("vmlinux"), b"kernel").unwrap();
+    fs::write(root.join("initramfs.cpio.gz"), b"initrd").unwrap();
+    for path in ["share/hidden/shown", "share/writable", "other", "outside"] {
+        fs::create_dir_all(root.join(path)).unwrap();
+    }
+    let absolute = |relative: &str| root.join(relative).to_str().unwrap().to_owned();
+    let (kernel, initrd) = (absolute("vmlinux"), absolute("initramfs.cpio.gz"));
+    let boot = ["--memory", "128M", "--kernel", &kernel, "--initrd", &initrd];
+    let share = format!("{},share,rw", aggregate_child_name(0, "/data"));
+    let other = format!("{},other,ro", aggregate_child_name(1, "/other"));
+    let aggregate = [
+        "--mount-aggregate",
+        "/run/nvx/shares",
+        "--mount-child",
+        &share,
+        "--mount-child",
+        &other,
+    ];
+    let (hidden, shown, writable) = (
+        absolute("share/hidden"),
+        absolute("share/hidden/shown"),
+        absolute("share/writable"),
+    );
+    let policy = [
+        "--mount-deny",
+        &hidden,
+        "--mount-allow",
+        &shown,
+        "--mount-write",
+        &writable,
+    ];
+    let mut arguments = boot.to_vec();
+    arguments.extend(aggregate);
+    arguments.extend(policy);
+    let output = run_microvm(root, &arguments);
+    assert_eq!(output.status.code(), Some(0), "{}", text(&output.stderr));
+    assert_eq!(
+        text(&output.stdout),
+        "nvx-fake-openvmm: booted the microVM\n"
+    );
+
+    // One share with a relative root takes absolute policy paths too, beside the relative ones
+    // that OpenVMM resolves in it.
+    let mut arguments = boot.to_vec();
+    arguments.extend([
+        "--mount",
+        "/data,share,rw",
+        "--mount-deny",
+        &hidden,
+        "--mount-allow",
+        "hidden/shown",
+    ]);
+    let output = run_microvm(root, &arguments);
+    assert_eq!(output.status.code(), Some(0), "{}", text(&output.stderr));
+
+    // A path outside every share stays refused, as one that does not exist does.
+    for path in [absolute("outside"), absolute("share/missing")] {
+        let mut arguments = boot.to_vec();
+        arguments.extend(aggregate);
+        arguments.extend(["--mount-deny", &path]);
+        let output = run_microvm(root, &arguments);
+        assert_eq!(output.status.code(), Some(2), "{path}");
+        assert_eq!(
+            text(&output.stderr),
+            format!("nvx-fake-openvmm: invalid --mount-deny {path}\n")
+        );
+    }
 }

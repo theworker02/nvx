@@ -357,7 +357,11 @@ serves the sandbox profile: its managed lifecycle, with the capability on its
 standard input, the control console, and an outcome report at stop, and its
 one-shot runs, which run `/bin/echo`, `/bin/sleep`, `/bin/true`, or
 `/bin/false`, write an outcome report if asked, and exit with the workload's
-status. Kernel command-line tokens make it fail: `fake_exit_on_start=STATUS`,
+status. It also runs the microVMs of `nvx.py run`, without a guest: a cold
+boot, or the restore of a snapshot directory, prints that it booted or restored
+the microVM, writes an outcome report if asked, and exits with status 0, and a
+restore whose snapshot directory is missing fails with status 1. Kernel
+command-line tokens make it fail: `fake_exit_on_start=STATUS`,
 `fake_exit_status=STATUS`, `fake_guest_features=MASK`, and
 `fake_legacy_guest=1`, among others; see `nvx::testing::fake_openvmm`.
 

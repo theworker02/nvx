@@ -61,8 +61,27 @@
 //! argument in seconds, `/bin/true` and `/bin/false` exiting with 0 and 1, and any other program
 //! not found with 127, then writes an outcome report
 //! of operation `run` if `--microvm-report` asks for one, and exits with the workload's status,
-//! or with `STATUS` if the kernel command line has `fake_exit_status=STATUS`. Sandbox outcome
-//! reports take the form of OpenVMM's.
+//! or with `STATUS` if the kernel command line has `fake_exit_status=STATUS`.
+//!
+//! The fake also runs the microVMs of `nvx.py run` and `nvx-rs run`, whose command lines have
+//! neither a `--microvm-lifecycle` nor a sandbox block device, on the terminal. Such a command
+//! line takes `--processors` and at most one `--cpu-profile`, shares through one `--mount` or the
+//! children of an aggregate at `/run/nvx/shares`, whose relative policy paths name paths in the
+//! only share, as OpenVMM resolves them, and either boots a guest, with `--memory`, an optional
+//! `--memory-capacity`, and an existing `--kernel` and `--initrd`, or restores a snapshot, with
+//! `--restore-snapshot` and optional `--restore-processors`, `--restore-memory`, and
+//! `--restore-ready-path`. It runs no guest: after `fake_boot_delay_ms=MS`, it prints that it
+//! booted or restored the microVM on standard output, writes an outcome report of operation `run`
+//! if `--microvm-report` asks for one, and exits with 0, or with `STATUS` if the kernel command
+//! line, which such a command line may omit, has `fake_exit_status=STATUS`. A restore whose
+//! snapshot directory does not exist fails with status 1 and writes no report. A restore records
+//! its command line next to its snapshot, since it has no kernel. The outcome reports of sandboxes
+//! and of these runs take the form of OpenVMM's.
+//!
+//! Every `--mount-deny`, `--mount-allow`, and `--mount-write` path of a launch must exist in a
+//! shared directory. Like OpenVMM, the fake attributes each one to the share whose root contains
+//! it once it has resolved both, so a root that is relative to the working directory, as
+//! `nvx-rs run` passes it, contains the absolute paths below it.
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::fs::{self, OpenOptions};
@@ -164,6 +183,10 @@ enum Lifecycle {
     /// `--microvm-lifecycle one-shot`: the guest runs its entrypoint once, and OpenVMM exits with
     /// its status. Only the sandbox profile uses it.
     OneShot,
+    /// Neither a lifecycle nor a sandbox block device: the microVM that `nvx.py run` and
+    /// `nvx-rs run` boot, or restore from a snapshot, on the terminal, which OpenVMM runs until
+    /// the guest shuts down.
+    Run,
 }
 
 /// Parsed OpenVMM-compatible command line and fake-specific test controls.
@@ -175,6 +198,8 @@ struct Options {
     /// Whether the command line launches the sandbox profile of `nvx.py sandbox`: a container
     /// over EROFS layers and an ext4 scratch disk.
     sandbox: bool,
+    /// The snapshot directory that a run restores, or `None` for a cold boot.
+    restore: Option<PathBuf>,
     /// Control endpoint at which the fake accepts host sessions; empty for a one-shot run.
     endpoint: String,
     /// Path to the synthetic OpenVMM outcome report, which a one-shot run may omit.
@@ -266,8 +291,12 @@ pub fn main() -> ExitCode {
         eprintln!("{program}: failing the launch as requested");
         return ExitCode::from(code);
     }
-    if options.lifecycle == Lifecycle::OneShot {
-        let status = run_one_shot(&options);
+    let ended = match options.lifecycle {
+        Lifecycle::OneShot => Some(run_one_shot(&options)),
+        Lifecycle::Run => Some(run_microvm(&options)),
+        Lifecycle::Managed => None,
+    };
+    if let Some(status) = ended {
         let _ = io::stdout().flush();
         let _ = io::stderr().flush();
         std::process::exit(status);
@@ -340,6 +369,38 @@ fn run_one_shot(options: &Options) -> i32 {
     status
 }
 
+/// Boots or restores the microVM of a run of `nvx.py run` or `nvx-rs run`, as OpenVMM runs it on
+/// the terminal, and returns the status with which OpenVMM exits.
+///
+/// No guest runs. After the `fake_boot_delay_ms` delay, a cold boot prints `PROGRAM: booted the
+/// microVM`, and the restore of an existing snapshot directory `PROGRAM: restored the microVM`,
+/// on standard output; then the run writes its outcome report and ends with 0, or with the status
+/// of the `fake_exit_status=STATUS` token. A restore without its snapshot directory fails with 1,
+/// as OpenVMM fails a restore that it cannot read, and writes no report.
+fn run_microvm(options: &Options) -> i32 {
+    thread::sleep(options.boot_delay);
+    match &options.restore {
+        Some(snapshot) if !snapshot.is_dir() => {
+            eprintln!(
+                "{}: cannot restore {}: no such snapshot directory",
+                options.program,
+                snapshot.display()
+            );
+            return 1;
+        }
+        Some(_) => println!("{}: restored the microVM", options.program),
+        None => println!("{}: booted the microVM", options.program),
+    }
+    let status = options.exit_status.unwrap_or(0);
+    let (category, status_code) = if status == 0 {
+        ("success", 0)
+    } else {
+        ("guest-exit", status)
+    };
+    write_report(options, "run", category, status_code);
+    status
+}
+
 /// Returns the name of the running executable, such as `nvx-fake-openvmm`.
 fn program_name() -> String {
     std::env::args_os()
@@ -384,6 +445,20 @@ fn parse(program: &str, arguments: &[String]) -> Result<Options, String> {
         "--host-loopback",
         "--host-loopback-forward",
     ];
+    // The options that only the microVMs of `nvx.py run` take.
+    const RUN_VALUED: [&str; 7] = [
+        "--processors",
+        "--cpu-profile",
+        "--memory-capacity",
+        "--restore-snapshot",
+        "--restore-processors",
+        "--restore-memory",
+        "--restore-ready-path",
+    ];
+    // `nvx.py run` boots or restores its microVM without a lifecycle, and is no sandbox.
+    let run = !arguments
+        .iter()
+        .any(|argument| argument == "--microvm-lifecycle" || argument == "--microvm-sandbox-block");
     let mut values: BTreeMap<&str, Vec<&str>> = BTreeMap::new();
     let mut flags = BTreeSet::new();
     let mut iterator = arguments.iter();
@@ -391,7 +466,7 @@ fn parse(program: &str, arguments: &[String]) -> Result<Options, String> {
         let name = argument.as_str();
         if name == "--single-process" || name == "--microvm-control-auth-stdin" {
             flags.insert(name);
-        } else if VALUED.contains(&name) {
+        } else if VALUED.contains(&name) || (run && RUN_VALUED.contains(&name)) {
             let value = iterator
                 .next()
                 .ok_or_else(|| format!("{name} requires a value"))?;
@@ -400,12 +475,7 @@ fn parse(program: &str, arguments: &[String]) -> Result<Options, String> {
             return Err(format!("unsupported argument {name}"));
         }
     }
-    let single = |name: &str| -> Result<&str, String> {
-        match values.get(name).map(Vec::as_slice) {
-            Some([value]) => Ok(value),
-            _ => Err(format!("{name} must be given exactly once")),
-        }
-    };
+    let single = |name: &str| exactly_once(&values, name);
     let expect = |name: &str, expected: &str| -> Result<(), String> {
         let value = single(name)?;
         if value == expected {
@@ -418,10 +488,14 @@ fn parse(program: &str, arguments: &[String]) -> Result<Options, String> {
     // The sandbox profile of `nvx.py sandbox` puts its layers and scratch disk on sandbox block
     // devices, and may run one-shot.
     let sandbox = values.contains_key("--microvm-sandbox-block");
-    let lifecycle = match single("--microvm-lifecycle")? {
-        "managed" => Lifecycle::Managed,
-        "one-shot" if sandbox => Lifecycle::OneShot,
-        other => return Err(format!("unsupported lifecycle {other}")),
+    let lifecycle = if run {
+        Lifecycle::Run
+    } else {
+        match single("--microvm-lifecycle")? {
+            "managed" => Lifecycle::Managed,
+            "one-shot" if sandbox => Lifecycle::OneShot,
+            other => return Err(format!("unsupported lifecycle {other}")),
+        }
     };
     if !flags.contains("--single-process") {
         return Err("--single-process is required".to_owned());
@@ -438,14 +512,19 @@ fn parse(program: &str, arguments: &[String]) -> Result<Options, String> {
                 .to_owned();
             (endpoint, Some(PathBuf::from(single("--microvm-report")?)))
         }
-        Lifecycle::OneShot => {
+        Lifecycle::OneShot | Lifecycle::Run => {
+            let kind = if run {
+                "a microVM run"
+            } else {
+                "a one-shot run"
+            };
             for option in ["--virtio-console", "--microvm-control-console"] {
                 if values.contains_key(option) {
-                    return Err(format!("a one-shot run takes no {option}"));
+                    return Err(format!("{kind} takes no {option}"));
                 }
             }
             if flags.contains("--microvm-control-auth-stdin") {
-                return Err("a one-shot run takes no --microvm-control-auth-stdin".to_owned());
+                return Err(format!("{kind} takes no --microvm-control-auth-stdin"));
             }
             let report = match values.get("--microvm-report").map(Vec::as_slice) {
                 None => None,
@@ -459,28 +538,29 @@ fn parse(program: &str, arguments: &[String]) -> Result<Options, String> {
     if !["kvm", "mshv", "whp"].contains(&hypervisor) {
         return Err(format!("unsupported hypervisor {hypervisor}"));
     }
-    if !single("--memory")?.ends_with('M') {
-        return Err("--memory must be given in MiB".to_owned());
-    }
-    let identity = single("--microvm-workload-identity")?;
-    let workload_uid = identity
-        .split_once(':')
-        .and_then(|(uid, gid)| Some((uid.parse::<u32>().ok()?, gid.parse::<u32>().ok()?)))
-        .filter(|&(uid, gid)| uid != 0 && gid != 0)
-        .map(|(uid, _)| uid)
-        .ok_or_else(|| format!("invalid workload identity {identity}"))?;
-    let kernel = PathBuf::from(single("--kernel")?);
-    for path in [&kernel, &PathBuf::from(single("--initrd")?)] {
-        if !path.is_file() {
-            return Err(format!("{} does not exist", path.display()));
+    // A run uses the default workload identity of the guest, and records its command line next to
+    // the kernel of a cold boot or to the snapshot of a restore.
+    let (workload_uid, anchor, restore) = if run {
+        if values.contains_key("--microvm-workload-identity") {
+            return Err("a microVM run takes no --microvm-workload-identity".to_owned());
         }
-    }
+        let (anchor, restore) = check_run_boot(&values)?;
+        (65534, anchor, restore)
+    } else {
+        let (workload_uid, kernel) = check_boot(&values)?;
+        (workload_uid, kernel, None)
+    };
     if let Some(report) = &report
         && report.exists()
     {
         return Err(format!("report path {} already exists", report.display()));
     }
-    let command_line = single("--cmdline")?;
+    // A run passes the kernel command line that its user gives, if any.
+    let command_line = match values.get("--cmdline").map(Vec::as_slice) {
+        None if run => "",
+        Some([command_line]) if run => command_line,
+        _ => single("--cmdline")?,
+    };
     let tokens: Vec<&str> = command_line.split_whitespace().collect();
     let token_values = |name: &str| -> Vec<&str> {
         tokens
@@ -515,6 +595,10 @@ fn parse(program: &str, arguments: &[String]) -> Result<Options, String> {
             }
         }
         (0, children, share_targets, workload)
+    } else if run {
+        // A run shares as a sandbox does, and its kernel command line is its user's.
+        let (children, _) = sandbox_shares(&values)?;
+        (0, children, Vec::new(), Vec::new())
     } else {
         for option in ["--mount", "--mount-owner"] {
             if values.contains_key(option) {
@@ -543,16 +627,29 @@ fn parse(program: &str, arguments: &[String]) -> Result<Options, String> {
         let children = mapped_children(&values, maps)?;
         (maps, children, Vec::new(), Vec::new())
     };
+    // OpenVMM resolves a run's relative policy path in its only share.
+    let only_share = match children.as_slice() {
+        [only] if run && values.contains_key("--mount") => Some(only),
+        _ => None,
+    };
+    // OpenVMM attributes each policy path to the share whose root contains it once it has
+    // resolved both, so a root that is relative to the working directory contains the absolute
+    // paths below it. No policy path names a file child, which contains nothing.
+    let roots: Vec<PathBuf> = children
+        .iter()
+        .filter(|root| root.is_dir())
+        .filter_map(|root| fs::canonicalize(root).ok())
+        .collect();
     for option in ["--mount-deny", "--mount-allow", "--mount-write"] {
-        for path in values.get(option).into_iter().flatten() {
-            let path = Path::new(path);
-            // No policy path names a file child, which contains nothing.
-            if !path.exists()
-                || !children
-                    .iter()
-                    .any(|root| root.is_dir() && path.starts_with(root))
-            {
-                return Err(format!("invalid {option} {}", path.display()));
+        for given in values.get(option).into_iter().flatten() {
+            let path = match only_share {
+                Some(share) if Path::new(given).is_relative() => share.join(given),
+                _ => PathBuf::from(given),
+            };
+            let shared = fs::canonicalize(&path)
+                .is_ok_and(|path| roots.iter().any(|root| path.starts_with(root)));
+            if !shared {
+                return Err(format!("invalid {option} {}", Path::new(given).display()));
             }
         }
     }
@@ -595,9 +692,10 @@ fn parse(program: &str, arguments: &[String]) -> Result<Options, String> {
         program: program.to_owned(),
         lifecycle,
         sandbox,
+        restore,
         endpoint,
-        args_dump: kernel.with_file_name(format!("fake-openvmm-{token}.json")),
-        maps_dump: kernel.with_file_name(format!("fake-openvmm-{token}-maps.json")),
+        args_dump: anchor.with_file_name(format!("fake-openvmm-{token}.json")),
+        maps_dump: anchor.with_file_name(format!("fake-openvmm-{token}-maps.json")),
         report,
         hypervisor: hypervisor.to_owned(),
         exit_on_start: knob("fake_exit_on_start").and_then(|value| value.parse().ok()),
@@ -618,6 +716,111 @@ fn parse(program: &str, arguments: &[String]) -> Result<Options, String> {
         workload,
         network: network_summary(&values),
     })
+}
+
+/// Returns the one value of `name`, or fails unless it was given exactly once.
+fn exactly_once<'a>(values: &BTreeMap<&str, Vec<&'a str>>, name: &str) -> Result<&'a str, String> {
+    match values.get(name).map(Vec::as_slice) {
+        Some([value]) => Ok(value),
+        _ => Err(format!("{name} must be given exactly once")),
+    }
+}
+
+/// Returns the value of `name` if it was given, or fails if it was given more than once.
+fn at_most_once<'a>(
+    values: &BTreeMap<&str, Vec<&'a str>>,
+    name: &str,
+) -> Result<Option<&'a str>, String> {
+    match values.get(name).map(Vec::as_slice) {
+        None => Ok(None),
+        Some([value]) => Ok(Some(value)),
+        Some(_) => Err(format!("{name} must be given at most once")),
+    }
+}
+
+/// Checks the boot of a managed or one-shot launch, `--memory` in MiB, a non-root
+/// `--microvm-workload-identity UID:GID`, and an existing `--kernel` and `--initrd`, and returns
+/// the workload's UID and the kernel.
+fn check_boot(values: &BTreeMap<&str, Vec<&str>>) -> Result<(u32, PathBuf), String> {
+    if !exactly_once(values, "--memory")?.ends_with('M') {
+        return Err("--memory must be given in MiB".to_owned());
+    }
+    let identity = exactly_once(values, "--microvm-workload-identity")?;
+    let workload_uid = identity
+        .split_once(':')
+        .and_then(|(uid, gid)| Some((uid.parse::<u32>().ok()?, gid.parse::<u32>().ok()?)))
+        .filter(|&(uid, gid)| uid != 0 && gid != 0)
+        .map(|(uid, _)| uid)
+        .ok_or_else(|| format!("invalid workload identity {identity}"))?;
+    let kernel = PathBuf::from(exactly_once(values, "--kernel")?);
+    for path in [&kernel, &PathBuf::from(exactly_once(values, "--initrd")?)] {
+        if !path.is_file() {
+            return Err(format!("{} does not exist", path.display()));
+        }
+    }
+    Ok((workload_uid, kernel))
+}
+
+/// Checks how a run of `nvx.py run` starts its microVM, and returns the path next to which the
+/// fake records the command line, and the snapshot directory of a restore.
+///
+/// A run takes `--processors`, a positive count, and at most one `--cpu-profile`. A cold boot
+/// takes `--memory` and an optional `--memory-capacity`, in MiB, and an existing `--kernel` and
+/// `--initrd`, and records its command line next to the kernel. A restore takes
+/// `--restore-snapshot`, next to which it records its command line, at most one each of
+/// `--restore-processors`, which cannot exceed `--processors`, `--restore-memory` in MiB, and
+/// `--restore-ready-path`, and none of the options of a cold boot.
+fn check_run_boot(
+    values: &BTreeMap<&str, Vec<&str>>,
+) -> Result<(PathBuf, Option<PathBuf>), String> {
+    let count = |name: &str, value: &str| {
+        value
+            .parse::<u32>()
+            .ok()
+            .filter(|count| *count > 0)
+            .ok_or_else(|| format!("invalid {name} {value}"))
+    };
+    let mib = |name: &str| match at_most_once(values, name)? {
+        Some(value) if !value.ends_with('M') => Err(format!("{name} must be given in MiB")),
+        _ => Ok(()),
+    };
+    let processors = count("--processors", exactly_once(values, "--processors")?)?;
+    at_most_once(values, "--cpu-profile")?;
+    if let Some(snapshot) = at_most_once(values, "--restore-snapshot")? {
+        for option in ["--memory", "--memory-capacity", "--kernel", "--initrd"] {
+            if values.contains_key(option) {
+                return Err(format!("a restore takes no {option}"));
+            }
+        }
+        if let Some(restored) = at_most_once(values, "--restore-processors")?
+            && count("--restore-processors", restored)? > processors
+        {
+            return Err("--restore-processors cannot exceed --processors".to_owned());
+        }
+        mib("--restore-memory")?;
+        at_most_once(values, "--restore-ready-path")?;
+        let snapshot = PathBuf::from(snapshot);
+        return Ok((snapshot.clone(), Some(snapshot)));
+    }
+    for option in [
+        "--restore-processors",
+        "--restore-memory",
+        "--restore-ready-path",
+    ] {
+        if values.contains_key(option) {
+            return Err(format!("{option} requires --restore-snapshot"));
+        }
+    }
+    exactly_once(values, "--memory")?;
+    mib("--memory")?;
+    mib("--memory-capacity")?;
+    let kernel = PathBuf::from(exactly_once(values, "--kernel")?);
+    for path in [&kernel, &PathBuf::from(exactly_once(values, "--initrd")?)] {
+        if !path.is_file() {
+            return Err(format!("{} does not exist", path.display()));
+        }
+    }
+    Ok((kernel, None))
 }
 
 /// Checks the sandbox block devices of a sandbox: each layer, `ROLE:file:PATH,ro` with a role of
@@ -644,9 +847,10 @@ fn check_sandbox_blocks<'a>(blocks: impl Iterator<Item = &'a &'a str>) -> Result
     Ok(())
 }
 
-/// Returns the host directories of a sandbox's shares, for the checks of its policy paths, and
-/// the guest targets of its directory shares: one `--mount TARGET,HOST,MODE` of a directory, or
-/// the `--mount-child NAME,HOST,MODE[,file]` children of an aggregate at `/run/nvx/shares`.
+/// Returns the host directories of the shares of a sandbox or a run, for the checks of their
+/// policy paths, and the guest targets of their directory shares: one `--mount TARGET,HOST,MODE`
+/// of a directory, or the `--mount-child NAME,HOST,MODE[,file]` children of an aggregate at
+/// `/run/nvx/shares`.
 fn sandbox_shares(
     values: &BTreeMap<&str, Vec<&str>>,
 ) -> Result<(Vec<PathBuf>, Vec<String>), String> {
@@ -1366,14 +1570,14 @@ fn serve_client<S: Read + Write + Pending>(
 /// Writes the synthetic OpenVMM outcome report of `operation` if a report was requested and its
 /// destination is new.
 ///
-/// A sandbox's report takes the form of OpenVMM's, with the instance, the network policy that the
-/// command line requested, and every step of the teardown; a direct launch's keeps a shorter
-/// form.
+/// The report of a sandbox or a run takes the form of OpenVMM's, with the instance, the network
+/// policy that the command line requested, and every step of the teardown; a direct launch's
+/// keeps a shorter form.
 fn write_report(options: &Options, operation: &str, category: &str, status_code: i32) {
     let Some(path) = &options.report else {
         return;
     };
-    let report = if options.sandbox {
+    let report = if options.sandbox || options.lifecycle == Lifecycle::Run {
         let mut instance = [0u8; 16];
         let _ = getrandom::fill(&mut instance);
         let instance: String = instance.iter().map(|byte| format!("{byte:02x}")).collect();
@@ -1568,6 +1772,190 @@ mod tests {
             assert_eq!(
                 mount_child_host(&value, index),
                 Err(format!("invalid --mount-child {value}"))
+            );
+        }
+    }
+
+    /// Returns a directory with a kernel, an initramfs, a share with a `hidden` directory, and a
+    /// snapshot directory, and the parse of the command line that `arguments` gives with the
+    /// paths of that directory in place of `{dir}`.
+    fn parse_run(arguments: &[&str]) -> (tempfile::TempDir, Result<Options, String>) {
+        let temporary = tempfile::tempdir().unwrap();
+        let root = temporary.path();
+        fs::write(root.join("vmlinux"), b"kernel").unwrap();
+        fs::write(root.join("initramfs.cpio.gz"), b"initrd").unwrap();
+        fs::create_dir_all(root.join("share").join("hidden")).unwrap();
+        fs::create_dir(root.join("snapshot")).unwrap();
+        let directory = root.to_str().unwrap();
+        let arguments: Vec<String> = arguments
+            .iter()
+            .map(|argument| argument.replace("{dir}", directory))
+            .collect();
+        let options = parse("openvmm", &arguments);
+        (temporary, options)
+    }
+
+    /// The options of every run, before those of its boot or restore.
+    const RUN: [&str; 7] = [
+        "--single-process",
+        "--machine",
+        "microvm",
+        "--processors",
+        "4",
+        "--hypervisor",
+        "kvm",
+    ];
+
+    fn run_with<'a>(extra: &[&'a str]) -> Vec<&'a str> {
+        RUN.iter().chain(extra).copied().collect()
+    }
+
+    #[test]
+    fn runs_boot_or_restore_without_a_lifecycle() {
+        let boot = run_with(&[
+            "--memory",
+            "128M",
+            "--memory-capacity",
+            "1024M",
+            "--kernel",
+            "{dir}/vmlinux",
+            "--initrd",
+            "{dir}/initramfs.cpio.gz",
+            "--cpu-profile",
+            "host",
+            "--mount",
+            "/data,{dir}/share,rw",
+            "--mount-deny",
+            "hidden",
+        ]);
+        let (temporary, options) = parse_run(&boot);
+        let options = options.unwrap();
+        assert_eq!(options.lifecycle, Lifecycle::Run);
+        assert!(!options.sandbox);
+        assert_eq!(options.restore, None);
+        assert_eq!(options.exit_status, None);
+        assert_eq!(
+            options.args_dump,
+            temporary.path().join("fake-openvmm-.json")
+        );
+        let restore = run_with(&[
+            "--restore-snapshot",
+            "{dir}/snapshot",
+            "--restore-processors",
+            "2",
+            "--restore-memory",
+            "512M",
+            "--restore-ready-path",
+            "{dir}/ready.sock",
+            "--cmdline",
+            "fake_exit_status=3",
+            "--microvm-report",
+            "{dir}/share/report.json",
+        ]);
+        let (temporary, options) = parse_run(&restore);
+        let options = options.unwrap();
+        let snapshot = temporary.path().join("snapshot");
+        assert_eq!(options.restore.as_ref(), Some(&snapshot));
+        assert_eq!(options.exit_status, Some(3));
+        // A restore has no kernel, so the command line goes next to the snapshot.
+        assert_eq!(
+            options.args_dump,
+            temporary.path().join("fake-openvmm-share.json")
+        );
+    }
+
+    #[test]
+    fn runs_refuse_what_their_boot_or_restore_does_not_take() {
+        const KERNEL: [&str; 4] = [
+            "--kernel",
+            "{dir}/vmlinux",
+            "--initrd",
+            "{dir}/initramfs.cpio.gz",
+        ];
+        fn boot(extra: &[&'static str]) -> Vec<&'static str> {
+            let mut arguments = vec!["--memory", "128M"];
+            arguments.extend(KERNEL);
+            arguments.extend(extra);
+            run_with(&arguments)
+        }
+        fn restore(extra: &[&'static str]) -> Vec<&'static str> {
+            let mut arguments = vec!["--restore-snapshot", "{dir}/snapshot"];
+            arguments.extend(extra);
+            run_with(&arguments)
+        }
+        let kernel = KERNEL;
+        let cases: Vec<(Vec<&str>, &str)> = vec![
+            (
+                restore(&["--memory", "128M"]),
+                "a restore takes no --memory",
+            ),
+            (restore(&kernel), "a restore takes no --kernel"),
+            (
+                restore(&["--restore-processors", "8"]),
+                "--restore-processors cannot exceed --processors",
+            ),
+            (
+                restore(&["--restore-memory", "1G"]),
+                "--restore-memory must be given in MiB",
+            ),
+            (
+                boot(&["--restore-processors", "2"]),
+                "--restore-processors requires --restore-snapshot",
+            ),
+            (
+                boot(&["--memory-capacity", "2"]),
+                "--memory-capacity must be given in MiB",
+            ),
+            (
+                boot(&["--cpu-profile", "host", "--cpu-profile", "auto"]),
+                "--cpu-profile must be given at most once",
+            ),
+            (
+                boot(&["--microvm-workload-identity", "1000:1000"]),
+                "a microVM run takes no --microvm-workload-identity",
+            ),
+            (
+                boot(&["--virtio-console", "none"]),
+                "a microVM run takes no --virtio-console",
+            ),
+            (
+                boot(&["--mount", "/data,{dir}/share,ro", "--mount-deny", "missing"]),
+                "invalid --mount-deny missing",
+            ),
+            (
+                boot(&["--mount-allow", "hidden"]),
+                "invalid --mount-allow hidden",
+            ),
+        ];
+        for (arguments, message) in cases {
+            let (_temporary, options) = parse_run(&arguments);
+            assert_eq!(options.err().as_deref(), Some(message), "{arguments:?}");
+        }
+        let mut missing = RUN.to_vec();
+        missing.truncate(3);
+        missing.extend(["--hypervisor", "kvm", "--memory", "128M"]);
+        let (_temporary, options) = parse_run(&missing);
+        assert_eq!(
+            options.err().as_deref(),
+            Some("--processors must be given exactly once")
+        );
+    }
+
+    #[test]
+    fn launches_with_a_lifecycle_take_no_options_of_a_run() {
+        for option in ["--processors", "--cpu-profile", "--restore-snapshot"] {
+            let arguments = [
+                "--single-process",
+                "--microvm-lifecycle",
+                "managed",
+                option,
+                "1",
+            ];
+            let (_temporary, options) = parse_run(&arguments);
+            assert_eq!(
+                options.err(),
+                Some(format!("unsupported argument {option}")),
+                "{option}"
             );
         }
     }
