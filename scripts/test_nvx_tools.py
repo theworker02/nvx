@@ -12923,14 +12923,13 @@ class AciSandboxRunnerTests(unittest.TestCase):
             environment = self._environment(root, paths)
 
             self.assertEqual(environment["ACI_EDGE_SANDBOXES_E2E_HYPERVISOR"], "kvm")
+            # The test locates the artifacts in the checkout, whose build provenance
+            # identifies them, rather than by their paths.
             self.assertEqual(
-                Path(environment["ACI_EDGE_SANDBOXES_E2E_OPENVMM"]),
-                paths["openvmm"].resolve(),
+                Path(environment["ACI_EDGE_SANDBOXES_E2E_ARTIFACTS_DIR"]),
+                BuildConstants.REPO_ROOT.resolve(),
             )
-            self.assertEqual(
-                Path(environment["ACI_EDGE_SANDBOXES_E2E_INITRD"]),
-                paths[AlpineBuildConstants.INITRAMFS_NAME].resolve(),
-            )
+            self.assertNotIn("ACI_EDGE_SANDBOXES_E2E_OPENVMM", environment)
             self.assertEqual(
                 Path(environment["ACI_EDGE_SANDBOXES_E2E_STATE_ROOT"]),
                 (root / "state").resolve(),
@@ -13006,9 +13005,9 @@ class AciSandboxRunnerTests(unittest.TestCase):
     ) -> tuple[Path, str]:
         """Runs the handler with a test command that leaves one sandbox provisioned.
 
-        The sandbox gets `records` as extra state files; `None` leaves only the lock
-        directories that deprovisioning keeps. Returns the state root that the command
-        used and the handler's standard error.
+        The sandbox gets `records` as extra state files; `None` leaves only an empty
+        backend directory. Returns the state root that the command used and the handler's
+        standard error.
         """
         state_roots: list[Path] = []
 
@@ -13021,7 +13020,7 @@ class AciSandboxRunnerTests(unittest.TestCase):
         def fake_run(
             command: list[str], *, env: dict[str, str], check: bool
         ) -> subprocess.CompletedProcess[bytes]:
-            (state_roots[0] / "filesystem" / ".locks").mkdir(parents=True)
+            (state_roots[0] / "filesystem").mkdir(parents=True)
             if records is not None:
                 sandbox = state_roots[0] / "network" / ("a" * 32)
                 sandbox.mkdir(parents=True)
@@ -13064,7 +13063,9 @@ class AciSandboxRunnerTests(unittest.TestCase):
         self.assertEqual(stderr, "")
 
     def test_handler_keeps_state_of_sandboxes_left_provisioned(self):
-        state_root, stderr = self._run_leaving({"runtime.json": {"pid": 4242}})
+        state_root, stderr = self._run_leaving(
+            {"runtime.json": {"process": {"pid": 4242}}}
+        )
 
         sandbox = state_root / "network" / ("a" * 32)
         self.assertTrue((sandbox / "runtime.json").is_file())

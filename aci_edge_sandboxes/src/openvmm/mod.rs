@@ -7,8 +7,9 @@
 //! [`OpenVmmBackend`] converts the contract's requests into the launch specifications, policies,
 //! and workloads of [`nvx`], and maps NVX's errors onto the contract's error codes. It keeps each
 //! sandbox in a state directory under [`OpenVmmConfig::state_root`], which holds the sandbox's
-//! configuration and the files of its VM [`Instance`](nvx::host::instance::Instance), so every
-//! operation can run in a different process:
+//! configuration and the store of its VM [`Instance`](nvx::host::instance::Instance): the lock,
+//! the launch journal, and the runtime record of NVX's sandbox store, so every operation can run
+//! in a different process:
 //!
 //! - **provision** validates the request and records the configuration. No VM runs yet.
 //! - **start** launches a detached OpenVMM process with the managed lifecycle, passes it a fresh
@@ -25,8 +26,14 @@
 //!   [`OpenVmmConfig::stop_timeout`].
 //! - **deprovision** deletes the state directory.
 //!
-//! Every operation first reconciles the recorded OpenVMM process with the host: a sandbox whose
-//! VM died is treated as provisioned again.
+//! Every operation first finds the sandbox's VM as NVX's supervisor reattaches to it after a
+//! restart: it ends a start whose caller died, and a sandbox whose VM died is treated as
+//! provisioned again. The store records the runtime identity of each VM: the identities of its
+//! OpenVMM, kernel, and initramfs, which [`OpenVmmConfig::runtime_identity`] gives or the install
+//! metadata of the artifacts' release or checkout names, and the contract versions of the build
+//! that started it. A VM whose runtime identity differs from the backend's, as after an upgrade,
+//! fails every operation with [`ErrorCode::BackendError`](crate::ErrorCode::BackendError), and
+//! keeps running: only the build and artifacts that started it can drive or stop it.
 //!
 //! # Policy honor matrix
 //!
@@ -101,10 +108,10 @@
 //!
 //! # Concurrency and cancellation
 //!
-//! Lifecycle transitions of one sandbox are serialized by a lock file. Executions are serialized
-//! by the guest: a second exec waits up to [`OpenVmmConfig::control_timeout`] for the first to
-//! finish. A stop that cannot reach the guest within its timeout terminates the VM, and any
-//! running exec then fails.
+//! Lifecycle transitions of one sandbox are serialized by the lock of its store. Executions are
+//! serialized by the guest: a second exec waits up to [`OpenVmmConfig::control_timeout`] for the
+//! first to finish. A stop that cannot reach the guest within its timeout terminates the VM, and
+//! any running exec then fails.
 //!
 //! The guest agent contains each workload in a cgroup and kills whatever the workload leaves
 //! behind when its first process exits, so no workload process outlives its exec.
@@ -133,9 +140,10 @@ use std::time::Duration;
 
 use nvx::Artifacts;
 use nvx::host::filesystem::{self, ExportPlan, ExportRequest, PathList};
-use nvx::host::instance::{Execution, RuntimeRecord, WorkloadOutcome};
+use nvx::host::instance::{self, Execution, Found, LockedInstance, WorkloadOutcome};
 use nvx::host::launch::{LaunchSpec, WorkloadIdentity};
 use nvx::host::report::Report;
+use nvx::host::store::RuntimeIdentity;
 use nvx::host::{network, platform};
 use nvx::protocol::{
     self, MAX_ARGUMENT_BYTES, MAX_CWD_BYTES, MAX_OUTPUT_BYTES, MAX_TIMEOUT_MS, Workload,
@@ -169,11 +177,6 @@ pub struct OpenVmmBackend {
     store: StateStore,
 }
 
-enum RunState {
-    Provisioned,
-    Running(RuntimeRecord),
-}
-
 impl OpenVmmBackend {
     /// Creates the backend, resolving relative paths and creating the state root.
     ///
@@ -198,16 +201,32 @@ impl OpenVmmBackend {
 
     /// Returns the path of the OpenVMM log of a sandbox's latest start, for diagnostics.
     pub fn log_path(&self, sandbox_id: &SandboxId) -> PathBuf {
-        self.store.instance(sandbox_id).log_path()
+        self.store.log_path(sandbox_id)
     }
 
-    /// Returns whether the recorded OpenVMM process still runs, clearing stale runtime state;
-    /// see [`Instance::reconcile`](nvx::host::instance::Instance::reconcile).
-    fn reconcile(&self, sandbox_id: &SandboxId) -> Result<RunState> {
-        Ok(match self.store.instance(sandbox_id).reconcile()? {
-            Some(runtime) => RunState::Running(runtime),
-            None => RunState::Provisioned,
-        })
+    /// Finds the VM of the sandbox that `locked` holds, under the runtime identity of the
+    /// configured artifacts, which it reads only if the store records a VM; see
+    /// [`LockedInstance::find`].
+    fn find(&self, locked: &mut LockedInstance) -> Result<Found> {
+        Ok(locked.find(|| self.config.identify())?)
+    }
+
+    /// Checks that this host can run the configured artifacts, as [`Backend::probe`] does, and
+    /// returns their runtime identity.
+    fn check_host(&self) -> Result<RuntimeIdentity> {
+        Artifacts::new(
+            &self.config.openvmm,
+            &self.config.kernel,
+            &self.config.initrd,
+        )
+        .probe()?;
+        let runtime = self.config.identify()?;
+        #[cfg(feature = "testing")]
+        if self.config.skip_hypervisor_probe {
+            return Ok(runtime);
+        }
+        platform::probe_hypervisor(self.config.hypervisor)?;
+        Ok(runtime)
     }
 
     /// Returns the launch specification of a provisioned sandbox.
@@ -446,17 +465,7 @@ impl Backend for OpenVmmBackend {
     }
 
     fn probe(&self) -> Result<()> {
-        Artifacts::new(
-            &self.config.openvmm,
-            &self.config.kernel,
-            &self.config.initrd,
-        )
-        .probe()?;
-        #[cfg(feature = "testing")]
-        if self.config.skip_hypervisor_probe {
-            return Ok(());
-        }
-        Ok(platform::probe_hypervisor(self.config.hypervisor)?)
+        self.check_host().map(drop)
     }
 
     fn validate_provision(&self, request: &ProvisionRequest) -> Result<()> {
@@ -548,7 +557,7 @@ impl Backend for OpenVmmBackend {
         spec.kernel_command_line()?;
         let sandbox_id = SandboxId::generate()?;
         // Windows names each start's control pipe afresh, but every name has the same length.
-        self.store.instance(&sandbox_id).check_launch(&spec)?;
+        instance::check_launch(&self.store.dir(&sandbox_id), &spec)?;
         self.store.create(&sandbox_id, &record)?;
         Ok(ProvisionResult {
             sandbox_id,
@@ -557,17 +566,22 @@ impl Backend for OpenVmmBackend {
     }
 
     fn start(&self, sandbox_id: &SandboxId) -> Result<StartResult> {
-        let (_guard, record) = self.store.lock_and_load(sandbox_id)?;
-        if let RunState::Running(_) = self.reconcile(sandbox_id)? {
-            return Err(Error::already_started(format!(
-                "sandbox {sandbox_id} is already running"
-            )));
+        let (mut locked, record) = self.store.lock_and_load(sandbox_id)?;
+        match self.find(&mut locked)? {
+            Found::Stopped => {}
+            Found::Running(_) => {
+                return Err(Error::already_started(format!(
+                    "sandbox {sandbox_id} is already running"
+                )));
+            }
+            Found::Mismatched(mismatched) => return Err(mismatched.error().into()),
         }
-        self.probe()?;
-        let started = self
-            .store
-            .instance(sandbox_id)
-            .start(&self.launch_spec(&record), self.config.start_timeout)?;
+        let runtime = self.check_host()?;
+        let started = locked.start(
+            &self.launch_spec(&record),
+            &runtime,
+            self.config.start_timeout,
+        )?;
         let mut metadata = Metadata::new();
         let boot_ms = u64::try_from(started.boot.as_millis()).unwrap_or(u64::MAX);
         metadata.insert("bootMilliseconds".to_owned(), boot_ms.into());
@@ -583,25 +597,23 @@ impl Backend for OpenVmmBackend {
         io: ExecIo,
     ) -> Result<Box<dyn ExecControl>> {
         let workload = prepare_exec(&request.process)?;
-        let instance = self.store.instance(sandbox_id);
-        let (runtime, capability) = {
-            let (_guard, _) = self.store.lock_and_load(sandbox_id)?;
-            match self.reconcile(sandbox_id)? {
-                RunState::Provisioned => {
+        // The lock is held only while the running VM is found, so a long workload cannot delay
+        // a stop.
+        let (instance, running) = {
+            let (mut locked, _) = self.store.lock_and_load(sandbox_id)?;
+            match self.find(&mut locked)? {
+                Found::Stopped => {
                     return Err(Error::not_started(format!(
                         "sandbox {sandbox_id} is not running"
                     )));
                 }
-                RunState::Running(runtime) => {
-                    let capability = instance.read_capability()?;
-                    (runtime, capability)
-                }
+                Found::Running(running) => (locked.instance().clone(), running),
+                Found::Mismatched(mismatched) => return Err(mismatched.error().into()),
             }
         };
         let execution = instance
             .exec(
-                &runtime,
-                &capability,
+                &running,
                 &workload,
                 self.config.control_timeout,
                 self.config.exec_response_grace,
@@ -622,16 +634,17 @@ impl Backend for OpenVmmBackend {
     }
 
     fn stop(&self, sandbox_id: &SandboxId) -> Result<StopResult> {
-        let (_guard, _) = self.store.lock_and_load(sandbox_id)?;
-        let RunState::Running(runtime) = self.reconcile(sandbox_id)? else {
-            return Err(Error::already_stopped(format!(
-                "sandbox {sandbox_id} is not running"
-            )));
+        let (mut locked, _) = self.store.lock_and_load(sandbox_id)?;
+        let running = match self.find(&mut locked)? {
+            Found::Stopped => {
+                return Err(Error::already_stopped(format!(
+                    "sandbox {sandbox_id} is not running"
+                )));
+            }
+            Found::Running(running) => running,
+            Found::Mismatched(mismatched) => return Err(mismatched.error().into()),
         };
-        let stopped = self
-            .store
-            .instance(sandbox_id)
-            .stop(&runtime, self.config.stop_timeout)?;
+        let stopped = locked.stop(running, self.config.stop_timeout)?;
         let mut metadata = Metadata::new();
         metadata.insert("forced".to_owned(), stopped.forced.into());
         if let Some(report) = &stopped.report {
@@ -643,15 +656,17 @@ impl Backend for OpenVmmBackend {
     }
 
     fn deprovision(&self, sandbox_id: &SandboxId) -> Result<DeprovisionResult> {
-        let (guard, _) = self.store.lock_and_load(sandbox_id)?;
-        if let RunState::Running(_) = self.reconcile(sandbox_id)? {
-            return Err(Error::already_started(format!(
-                "sandbox {sandbox_id} is running; stop it before deprovisioning"
-            )));
+        let (mut locked, _) = self.store.lock_and_load(sandbox_id)?;
+        match self.find(&mut locked)? {
+            Found::Stopped => {}
+            Found::Running(_) => {
+                return Err(Error::already_started(format!(
+                    "sandbox {sandbox_id} is running; stop it before deprovisioning"
+                )));
+            }
+            Found::Mismatched(mismatched) => return Err(mismatched.error().into()),
         }
-        self.store.remove(sandbox_id)?;
-        drop(guard);
-        self.store.remove_lock(sandbox_id);
+        self.store.remove(sandbox_id, locked)?;
         Ok(DeprovisionResult::default())
     }
 }

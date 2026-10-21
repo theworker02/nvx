@@ -57,3 +57,39 @@ fn incompatible_releases_are_reported_as_backend_unavailable() {
         .unwrap_err();
     assert_eq!(error.code(), ErrorCode::BackendUnavailable);
 }
+
+#[test]
+fn artifacts_named_by_path_need_a_runtime_identity() {
+    let directory = tempfile::tempdir().unwrap();
+    let file = |name: &str| {
+        let path = directory.path().join(name);
+        fs::write(&path, b"").unwrap();
+        path
+    };
+    let config = OpenVmmConfig::new(
+        file("openvmm"),
+        file("vmlinux"),
+        file("initramfs.cpio.gz"),
+        hypervisor(),
+        directory.path().join("state"),
+    );
+    assert_eq!(config.runtime_identity, None);
+    let Ok(nvx) = AciEdgeSandbox::openvmm(config) else {
+        // Hosts that cannot run the backend at all reject the configuration up front.
+        return;
+    };
+    // The files exist, but no install metadata names their identity, which the store records
+    // with each VM.
+    for error in [
+        nvx.probe().unwrap_err(),
+        nvx.provision(&ProvisionRequest::new()).unwrap_err(),
+    ] {
+        assert_eq!(error.code(), ErrorCode::BackendUnavailable, "{error}");
+        assert!(
+            error
+                .message()
+                .contains("set OpenVmmConfig::runtime_identity"),
+            "{error}"
+        );
+    }
+}

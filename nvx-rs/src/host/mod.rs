@@ -8,9 +8,10 @@
 //! - [`network`] lowers egress rules, and the egress policy files of `nvx.py`, into OpenVMM's
 //!   rules, and [`filesystem`] plans the export of host paths through OpenVMM's aggregate
 //!   virtio-fs device.
-//! - [`instance`] supervises one VM instance in a directory of its own: it starts OpenVMM and
-//!   waits until the guest is ready, reconciles recorded state with the host, runs workloads,
-//!   and stops the VM. [`report`] reads OpenVMM's outcome report.
+//! - [`instance`] drives one VM instance in a directory of its own, the [`store`] of its VM,
+//!   through the [`supervisor`] and the [`session`]: it starts OpenVMM and waits until the guest
+//!   is ready, reattaches to the VM after a restart, runs workloads, and stops the VM.
+//!   [`report`] reads OpenVMM's outcome report.
 //! - [`store`] keeps the runtime records of a sandbox in a private directory with one lock: the
 //!   runtime record of its VM, with the VM's runtime identity, and the journal of its launch,
 //!   through which an interrupted launch is recovered without signaling an unverified process.

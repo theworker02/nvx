@@ -4,8 +4,8 @@ use std::time::Duration;
 use aci_edge_sandboxes_model::spec::{is_valid_guest_network, is_valid_hostname};
 use nvx::Hypervisor;
 use nvx::host::artifacts::{Artifacts, absolute};
-use nvx::host::instance::SOCKET_NAME;
 use nvx::host::launch::{self, WorkloadIdentity};
+use nvx::host::store::{RuntimeIdentity, SOCKET_NAME};
 
 use crate::error::{Error, Result};
 
@@ -14,7 +14,8 @@ use crate::error::{Error, Result};
 /// Construct it with [`OpenVmmConfig::discover`], [`OpenVmmConfig::from_artifacts`],
 /// [`OpenVmmConfig::new`], [`OpenVmmConfig::from_release_dir`], or
 /// [`OpenVmmConfig::from_repo_layout`], then adjust the public fields. Defaults match
-/// `scripts/nvx.py sandbox`.
+/// `scripts/nvx.py sandbox`. Artifacts named by path, as by [`OpenVmmConfig::new`], also need
+/// their [`runtime_identity`](Self::runtime_identity).
 #[derive(Debug, Clone, PartialEq, Eq)]
 #[non_exhaustive]
 pub struct OpenVmmConfig {
@@ -24,6 +25,19 @@ pub struct OpenVmmConfig {
     pub kernel: PathBuf,
     /// The NVX Alpine initramfs (`initramfs.cpio.gz`): the guest userland and its control agent.
     pub initrd: PathBuf,
+    /// The runtime identity of the artifacts, which the store records with each sandbox's VM:
+    /// the identities of OpenVMM, the kernel, and the initramfs, with the contract versions of
+    /// this build. A VM that runs under another runtime identity, as after an upgrade, is reported
+    /// and neither driven nor stopped.
+    ///
+    /// Leave it unset for artifacts located in an NVX release or repository checkout, as by
+    /// [`from_release_dir`](Self::from_release_dir), [`from_repo_layout`](Self::from_repo_layout),
+    /// [`discover`](Self::discover), or [`from_artifacts`](Self::from_artifacts): every operation
+    /// that needs it then reads it from the install metadata of the release or checkout, a
+    /// release's `SHA256SUMS` or a checkout's build provenance, without hashing an artifact, so an
+    /// install upgraded in place is identified anew. Artifacts named by path have no install
+    /// metadata: without it, the backend is unavailable.
+    pub runtime_identity: Option<RuntimeIdentity>,
     /// Hypervisor used by OpenVMM.
     pub hypervisor: Hypervisor,
     /// Directory that holds per-sandbox state. Choose a directory private to the current user.
@@ -72,6 +86,9 @@ pub struct OpenVmmConfig {
     /// hosts without a hypervisor. Available only with the `testing` feature.
     #[cfg(feature = "testing")]
     pub skip_hypervisor_probe: bool,
+    /// The artifacts as [`from_artifacts`](Self::from_artifacts) received them, with the release
+    /// or checkout in which they were located, whose install metadata identifies them.
+    located: Option<Artifacts>,
 }
 
 impl OpenVmmConfig {
@@ -103,6 +120,7 @@ impl OpenVmmConfig {
             openvmm: openvmm.into(),
             kernel: kernel.into(),
             initrd: initrd.into(),
+            runtime_identity: None,
             hypervisor,
             state_root: state_root.into(),
             memory_mib: Self::DEFAULT_MEMORY_MIB,
@@ -119,22 +137,53 @@ impl OpenVmmConfig {
             breakaway_from_job: false,
             #[cfg(feature = "testing")]
             skip_hypervisor_probe: false,
+            located: None,
         }
     }
 
-    /// Creates a configuration from located [`Artifacts`].
+    /// Creates a configuration from [`Artifacts`], whose release or checkout, if they were located
+    /// in one, identifies them; see [`runtime_identity`](Self::runtime_identity).
     pub fn from_artifacts(
         artifacts: Artifacts,
         hypervisor: Hypervisor,
         state_root: impl Into<PathBuf>,
     ) -> Self {
-        Self::new(
-            artifacts.openvmm,
-            artifacts.kernel,
-            artifacts.initrd,
+        let mut config = Self::new(
+            artifacts.openvmm.clone(),
+            artifacts.kernel.clone(),
+            artifacts.initrd.clone(),
             hypervisor,
             state_root,
-        )
+        );
+        config.located = Some(artifacts);
+        config
+    }
+
+    /// Returns the runtime identity of the configured artifacts:
+    /// [`runtime_identity`](Self::runtime_identity) if it is set, and otherwise the one that the
+    /// install metadata of the release or checkout in which they were located names, read now.
+    ///
+    /// Fails with [`nvx::ErrorKind::Unavailable`] for artifacts named by path without one, and
+    /// when the metadata is missing or unreadable, or does not name the configured paths.
+    pub(crate) fn identify(&self) -> nvx::Result<RuntimeIdentity> {
+        if let Some(identity) = &self.runtime_identity {
+            return Ok(identity.clone());
+        }
+        let Some(mut artifacts) = self
+            .located
+            .clone()
+            .filter(|artifacts| artifacts.artifact_dir().is_some())
+        else {
+            return Err(nvx::Error::unavailable(
+                "the artifacts are named by path, so no install metadata identifies them: set \
+                 OpenVmmConfig::runtime_identity, or locate them in an NVX release or repository \
+                 checkout",
+            ));
+        };
+        artifacts.openvmm.clone_from(&self.openvmm);
+        artifacts.kernel.clone_from(&self.kernel);
+        artifacts.initrd.clone_from(&self.initrd);
+        artifacts.runtime_identity()
     }
 
     /// Creates a configuration with no NVX-specific input: the artifacts come from

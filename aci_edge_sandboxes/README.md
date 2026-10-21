@@ -625,6 +625,7 @@ Defaults:
 | `guest_network` | `10.0.0.2/24` |
 | `start_timeout`, `control_timeout` | 60 s |
 | `stop_timeout`, `exec_response_grace` | 30 s |
+| `runtime_identity` | none: the install metadata of the artifacts' release or checkout names it; see [Runtime identity](#runtime-identity) |
 
 Each timeout must be at most 30 days (`OpenVmmConfig::MAX_TIMEOUT`), and all
 but `exec_response_grace` must be positive. `guest_network` must be an address
@@ -636,6 +637,36 @@ Choose a `state_root` that only the current user can access.
 Windows and `$XDG_STATE_HOME/nvx/sandboxes` (default
 `~/.local/state/nvx/sandboxes`) elsewhere.
 
+### Runtime identity
+
+Each sandbox's state directory is the `nvx::host::store` of its VM, which
+records the runtime identity of the VM's start: the identities of its
+OpenVMM, kernel, and initramfs, and the boot and control contract versions of
+the build that started it. Every operation finds the sandbox's VM under the
+backend's runtime identity, so a backend never drives a VM that another NVX
+build, or other artifacts, started.
+
+- Artifacts located in a release or a repository checkout, by
+  `OpenVmmConfig::discover` from `NVX_ARTIFACTS_DIR`, an `nvx/` directory, or
+  the bundle, by `from_release_dir` or `from_repo_layout`, or by
+  `from_artifacts` with artifacts that `nvx::Artifacts` located, take their
+  identity from the directory's install metadata: the digests that a
+  release's `SHA256SUMS` lists, or the build provenance that `nvx.py` records
+  beside a checkout's guest artifacts. Nothing reads or hashes an artifact.
+  Pointing `openvmm`, `kernel`, or `initrd` of such a configuration at other
+  files leaves it without an identity.
+- Artifacts named by path, by `OpenVmmConfig::new` or by `discover` from
+  `NVX_OPENVMM`, `NVX_KERNEL`, and `NVX_INITRD`, have no install metadata. Set
+  `OpenVmmConfig::runtime_identity` to the identity that the deployment
+  records for them; it also replaces the identity of located artifacts.
+
+Without a runtime identity, `probe`, `provision`, and `start` fail with
+`backend_unavailable`, as does any operation on a sandbox whose store records a
+VM. An operation on a sandbox whose VM runs under another runtime identity,
+such as one that the build before an upgrade started, fails with
+`backend_error`, naming the parts that differ and OpenVMM's process ID, and
+leaves the VM running: stop it with the build and artifacts that started it.
+
 ### How it runs OpenVMM
 
 - **Provision** validates the request and records it in
@@ -646,10 +677,12 @@ Windows and `$XDG_STATE_HOME/nvx/sandboxes` (default
   system and starts the managed agent directly.
   - A fresh 32-byte capability travels through OpenVMM's standard-input pipe,
     which is closed before OpenVMM starts.
-  - Before launching OpenVMM, start records the control endpoint in
-    `launch.json`. If the caller dies before OpenVMM's process identity is
-    recorded, the next operation on the sandbox finds the VM through that
-    endpoint and terminates it, so no VM is left untracked.
+  - Before launching OpenVMM, start records the control endpoint and
+    OpenVMM's log in the store's launch journal, `launch.json`, and then
+    OpenVMM's process identity. If the caller dies before the VM is ready, the
+    next operation on the sandbox terminates the VM, through its process
+    identity, or through the endpoint's server if that process holds the log,
+    so no VM is left untracked.
   - OpenVMM runs detached from the caller: in a new session on Linux, and
     without the caller's console on Windows. It inherits no handle of the
     caller except its standard input and log, so a caller whose own output is
@@ -672,9 +705,13 @@ Windows and `$XDG_STATE_HOME/nvx/sandboxes` (default
 - **Deprovision** deletes the state directory. It refuses to remove a directory
   that contains unexpected files.
 
-The backend stores durable lifecycle state and reconciles it with the OpenVMM
-process before every operation. Operations can therefore run safely from
-different caller processes without forgetting a live VM. On Windows, set
+Before every operation, the backend reattaches to the VM that the sandbox's
+store records, as NVX's supervisor does after a restart: it checks that
+OpenVMM's process still runs, verifying the process rather than trusting its
+ID, under the backend's [runtime identity](#runtime-identity). A sandbox whose
+VM died is provisioned again. Operations can therefore run safely from
+different caller processes, one after another or after a caller restarts,
+without forgetting a live VM. On Windows, set
 `breakaway_from_job` if the caller runs inside a job object that would otherwise
 terminate the VM when the caller exits.
 
@@ -946,8 +983,8 @@ egress default of `allow` and no deny rule that covers the guest network; see
 | `start` or `deprovision` on a running sandbox | `AlreadyStarted` | `already_started` |
 | `stop` on a stopped sandbox | `AlreadyStopped` | `already_stopped` |
 | Unsupported policy or exec feature, oversized command, relative or oversized `process.cwd` | `PolicyValidation` | `policy_validation` |
-| Missing OpenVMM artifacts, inaccessible hypervisor, incompatible release or guest image, unsupported host | `BackendUnavailable` | `backend_unavailable` |
-| OpenVMM launch failure, boot timeout, control-session failure, I/O errors | `BackendError` | `backend_error` |
+| Missing OpenVMM artifacts, inaccessible hypervisor, incompatible release or guest image, no [runtime identity](#runtime-identity), unsupported host | `BackendUnavailable` | `backend_unavailable` |
+| OpenVMM launch failure, boot timeout, control-session failure, a VM of another runtime identity, I/O errors | `BackendError` | `backend_error` |
 
 Start failures name the OpenVMM log, `OpenVmmBackend::log_path`.
 

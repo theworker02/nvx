@@ -1,27 +1,48 @@
 //! Drives VM instances end to end against the `nvx-fake-openvmm` test double, which serves the
 //! real control protocol without running a VM.
+//!
+//! An orchestrator that starts an instance in a process of its own, which then exits, lets a test
+//! restart the orchestrator within the same host boot.
 #![cfg(all(
     feature = "host",
     feature = "testing",
     any(target_os = "linux", windows)
 ))]
 
+use std::env;
 use std::fs;
-use std::path::Path;
+use std::path::{Path, PathBuf};
+use std::process::{Command, Stdio};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::thread;
 use std::time::Duration;
 
-use nvx::host::instance::{self, Instance, WorkloadOutcome};
+use nvx::host::instance::{Found, Instance, Running, Started, Stopped, WorkloadOutcome};
 use nvx::host::launch::{LaunchSpec, PROCESS_COMMAND_LINE_LIMIT};
+use nvx::host::store::{ArtifactIdentity, IdentityPart, RuntimeIdentity};
 use nvx::protocol::{Workload, WorkloadEnvironment};
 use nvx::{Artifacts, ErrorKind, Hypervisor};
 
 const TIMEOUT: Duration = Duration::from_secs(30);
+/// The instance directory in which [`orchestrator_role`] starts a VM.
+const ORCHESTRATOR_INSTANCE: &str = "NVX_FAKE_OPENVMM_TEST_INSTANCE";
 
-/// Creates the fake guest artifacts and an instance directory below `directory`.
-fn setup(directory: &Path) -> (LaunchSpec, Instance) {
+/// Returns the runtime identity of these tests' launches, with the OpenVMM identity of the digit
+/// `openvmm`.
+fn runtime_with(openvmm: char) -> RuntimeIdentity {
+    let artifact = |digit: char| ArtifactIdentity::sha256(&digit.to_string().repeat(64)).unwrap();
+    RuntimeIdentity::new(artifact(openvmm), artifact('2'), artifact('3'))
+}
+
+/// Returns the runtime identity of these tests' launches.
+fn runtime() -> RuntimeIdentity {
+    runtime_with('1')
+}
+
+/// Creates the fake guest artifacts in `directory`, and returns the specification of a VM that
+/// runs them.
+fn spec(directory: &Path) -> LaunchSpec {
     fs::write(directory.join("vmlinux"), b"kernel").unwrap();
     fs::write(directory.join("initramfs.cpio.gz"), b"initrd").unwrap();
     let artifacts = Artifacts::new(
@@ -30,12 +51,47 @@ fn setup(directory: &Path) -> (LaunchSpec, Instance) {
         directory.join("initramfs.cpio.gz"),
     );
     let hypervisor = Hypervisor::platform_default().expect("tests run on Linux or Windows");
-    let state = directory.join("vm");
-    instance::create_private_dir(&state).unwrap();
-    (
-        LaunchSpec::new(artifacts, hypervisor),
-        Instance::new(state, "test"),
-    )
+    LaunchSpec::new(artifacts, hypervisor)
+}
+
+/// Creates the fake guest artifacts and an instance directory below `directory`.
+fn setup(directory: &Path) -> (LaunchSpec, Instance) {
+    let instance = Instance::create(directory.join("vm"), "test").unwrap();
+    (spec(directory), instance)
+}
+
+/// Finds the instance's VM under these tests' runtime identity.
+fn find(instance: &Instance) -> Found {
+    instance.lock(None).unwrap().find(|| Ok(runtime())).unwrap()
+}
+
+/// Returns the instance's running VM.
+fn running(instance: &Instance) -> Running {
+    match find(instance) {
+        Found::Running(running) => running,
+        other => panic!("the instance does not run: {other:?}"),
+    }
+}
+
+/// Starts the instance's VM, which does not run, with `timeout`.
+fn start_within(instance: &Instance, spec: &LaunchSpec, timeout: Duration) -> nvx::Result<Started> {
+    let mut locked = instance.lock(None).unwrap();
+    assert!(matches!(locked.find(|| Ok(runtime()))?, Found::Stopped));
+    locked.start(spec, &runtime(), timeout)
+}
+
+/// Starts the instance's VM, which does not run.
+fn start(instance: &Instance, spec: &LaunchSpec) -> nvx::Result<Started> {
+    start_within(instance, spec, TIMEOUT)
+}
+
+/// Stops the instance's running VM with `timeout`.
+fn stop(instance: &Instance, timeout: Duration) -> nvx::Result<Stopped> {
+    let mut locked = instance.lock(None).unwrap();
+    let Found::Running(running) = locked.find(|| Ok(runtime()))? else {
+        panic!("the instance does not run");
+    };
+    locked.stop(running, timeout)
 }
 
 fn workload(argv: &[&str]) -> Workload<'static> {
@@ -53,12 +109,10 @@ struct Output {
     stderr: Vec<u8>,
 }
 
+/// Runs `workload` in the instance's running VM, which it finds as every exec does.
 fn run(instance: &Instance, workload: &Workload<'_>, cancel: &AtomicBool) -> Output {
-    let runtime = instance.runtime().unwrap().expect("the instance runs");
-    let capability = instance.read_capability().unwrap();
-    let execution = instance
-        .exec(&runtime, &capability, workload, TIMEOUT, TIMEOUT)
-        .unwrap();
+    let running = running(instance);
+    let execution = instance.exec(&running, workload, TIMEOUT, TIMEOUT).unwrap();
     let (mut stdout, mut stderr) = (Vec::new(), Vec::new());
     let outcome = execution
         .pump(
@@ -80,15 +134,24 @@ fn run(instance: &Instance, workload: &Workload<'_>, cancel: &AtomicBool) -> Out
     }
 }
 
+/// Returns whether the store of `instance` records neither a launch nor a VM.
+fn records_nothing(instance: &Instance) -> bool {
+    let store = instance.store();
+    store.journal().unwrap().is_none()
+        && store.runtime().unwrap().is_none()
+        && store.read_capability().is_err()
+}
+
 #[test]
 fn instances_start_run_workloads_and_stop() {
     let directory = tempfile::tempdir().unwrap();
     let (spec, instance) = setup(directory.path());
-    assert_eq!(instance.reconcile().unwrap(), None);
-    let started = instance.start(&spec, TIMEOUT).unwrap();
-    assert_eq!(instance.reconcile().unwrap(), Some(started.runtime.clone()));
-    // Only a running instance keeps a launch capability.
-    assert!(instance.launch().unwrap().is_none());
+    assert!(matches!(find(&instance), Found::Stopped));
+    let started = start(&instance, &spec).unwrap();
+    assert_eq!(started.runtime.runtime(), &runtime());
+    assert_eq!(running(&instance).runtime(), &started.runtime);
+    // Only a launch in progress keeps a journal.
+    assert!(instance.store().journal().unwrap().is_none());
 
     let idle = AtomicBool::new(false);
     let output = run(
@@ -117,13 +180,16 @@ fn instances_start_run_workloads_and_stop() {
         refused.stderr
     );
 
-    let stopped = instance.stop(&started.runtime, TIMEOUT).unwrap();
+    let stopped = stop(&instance, TIMEOUT).unwrap();
     assert!(!stopped.forced);
     let report = stopped.report.expect("the VM reports its outcome");
     assert_eq!(report.category.as_deref(), Some("success"));
     assert_eq!(report.teardown_complete, Some(true));
-    assert_eq!(instance.reconcile().unwrap(), None);
-    assert!(instance.read_capability().is_err());
+    assert!(matches!(find(&instance), Found::Stopped));
+    assert!(records_nothing(&instance));
+    // The log and the report outlive the run.
+    assert!(instance.log_path().is_file());
+    assert!(instance.report_path().is_file());
 }
 
 #[test]
@@ -131,33 +197,27 @@ fn timeouts_are_checked_before_they_are_used() {
     let directory = tempfile::tempdir().unwrap();
     let (spec, instance) = setup(directory.path());
     for timeout in [Duration::ZERO, Duration::MAX] {
-        let error = instance.start(&spec, timeout).unwrap_err();
+        let error = start_within(&instance, &spec, timeout).unwrap_err();
         assert_eq!(error.kind(), ErrorKind::Unsupported, "{error}");
         // Nothing was launched.
-        assert!(instance.launch().unwrap().is_none());
-        assert!(instance.runtime().unwrap().is_none());
+        assert!(records_nothing(&instance));
     }
-    let started = instance.start(&spec, TIMEOUT).unwrap();
-    let capability = instance.read_capability().unwrap();
+    start(&instance, &spec).unwrap();
     let echo = workload(&["/bin/echo", "hello"]);
+    let vm = running(&instance);
     for (control_timeout, response_grace) in [
         (Duration::ZERO, TIMEOUT),
         (Duration::MAX, TIMEOUT),
         (TIMEOUT, Duration::MAX),
     ] {
-        let Err(error) = instance.exec(
-            &started.runtime,
-            &capability,
-            &echo,
-            control_timeout,
-            response_grace,
-        ) else {
+        let Err(error) = instance.exec(&vm, &echo, control_timeout, response_grace) else {
             panic!("exec accepted {control_timeout:?} and {response_grace:?}");
         };
         assert_eq!(error.kind(), ErrorKind::Unsupported, "{error}");
     }
+    drop(vm);
     for timeout in [Duration::ZERO, Duration::MAX] {
-        let error = instance.stop(&started.runtime, timeout).unwrap_err();
+        let error = stop(&instance, timeout).unwrap_err();
         assert_eq!(error.kind(), ErrorKind::Unsupported, "{error}");
     }
     // The refused requests left the VM running.
@@ -165,30 +225,33 @@ fn timeouts_are_checked_before_they_are_used() {
     let output = run(&instance, &echo, &idle);
     assert_eq!(output.outcome, WorkloadOutcome::Exited(0));
     assert_eq!(output.stdout, b"hello\n");
-    instance.stop(&started.runtime, TIMEOUT).unwrap();
+    stop(&instance, TIMEOUT).unwrap();
 }
 
 #[test]
 fn launches_beyond_the_process_command_line_limit_are_refused() {
     let directory = tempfile::tempdir().unwrap();
     let (mut spec, instance) = setup(directory.path());
+    // The log of an earlier start outlives a launch that is refused.
+    start(&instance, &spec).unwrap();
+    stop(&instance, TIMEOUT).unwrap();
+    let log = fs::read(instance.log_path()).unwrap();
     // The program's path counts toward the command line, which every host holds to the limit.
     spec.openvmm = directory
         .path()
         .join("o".repeat(PROCESS_COMMAND_LINE_LIMIT));
-    let error = instance.start(&spec, TIMEOUT).unwrap_err();
+    let error = start(&instance, &spec).unwrap_err();
     assert_eq!(error.kind(), ErrorKind::Unsupported, "{error}");
     // Nothing was launched or recorded.
-    assert!(instance.launch().unwrap().is_none());
-    assert!(instance.runtime().unwrap().is_none());
-    assert!(instance.read_capability().is_err());
+    assert!(records_nothing(&instance));
+    assert_eq!(fs::read(instance.log_path()).unwrap(), log);
 }
 
 #[test]
 fn cancellation_ends_a_running_workload() {
     let directory = tempfile::tempdir().unwrap();
     let (spec, instance) = setup(directory.path());
-    let started = instance.start(&spec, TIMEOUT).unwrap();
+    start(&instance, &spec).unwrap();
     let cancel = Arc::new(AtomicBool::new(false));
     let canceller = thread::spawn({
         let cancel = Arc::clone(&cancel);
@@ -205,7 +268,19 @@ fn cancellation_ends_a_running_workload() {
     canceller.join().unwrap();
     assert_eq!(output.outcome, WorkloadOutcome::Cancelled);
     assert_eq!(output.stdout, b"started\n");
-    instance.stop(&started.runtime, TIMEOUT).unwrap();
+    stop(&instance, TIMEOUT).unwrap();
+}
+
+#[test]
+fn unresponsive_guests_are_terminated() {
+    let directory = tempfile::tempdir().unwrap();
+    let (mut spec, instance) = setup(directory.path());
+    spec.kernel_parameters = "fake_ignore_stop=1".to_owned();
+    start(&instance, &spec).unwrap();
+    let stopped = stop(&instance, Duration::from_millis(500)).unwrap();
+    assert!(stopped.forced);
+    assert!(matches!(find(&instance), Found::Stopped));
+    assert!(records_nothing(&instance));
 }
 
 #[test]
@@ -214,7 +289,7 @@ fn guests_without_required_features_are_refused() {
     let (mut spec, instance) = setup(directory.path());
     // Cancellation alone.
     spec.kernel_parameters = "fake_guest_features=1".to_owned();
-    let error = instance.start(&spec, TIMEOUT).unwrap_err();
+    let error = start(&instance, &spec).unwrap_err();
     assert_eq!(error.kind(), ErrorKind::Unavailable);
     assert!(
         error.message().contains("lacks control features"),
@@ -222,8 +297,8 @@ fn guests_without_required_features_are_refused() {
     );
     assert!(error.message().contains("sandbox test failed to start"));
     // The rejected VM is gone and leaves no runtime state behind.
-    assert_eq!(instance.reconcile().unwrap(), None);
-    assert!(instance.runtime().unwrap().is_none());
+    assert!(matches!(find(&instance), Found::Stopped));
+    assert!(records_nothing(&instance));
 }
 
 #[test]
@@ -231,7 +306,7 @@ fn launches_that_exit_fail_to_start() {
     let directory = tempfile::tempdir().unwrap();
     let (mut spec, instance) = setup(directory.path());
     spec.kernel_parameters = "fake_exit_on_start=4".to_owned();
-    let error = instance.start(&spec, TIMEOUT).unwrap_err();
+    let error = start(&instance, &spec).unwrap_err();
     assert_eq!(error.kind(), ErrorKind::Exited, "{error}");
     assert!(
         error
@@ -239,5 +314,72 @@ fn launches_that_exit_fail_to_start() {
             .contains(&instance.log_path().display().to_string()),
         "{error}"
     );
-    assert_eq!(instance.reconcile().unwrap(), None);
+    assert!(matches!(find(&instance), Found::Stopped));
+    assert!(records_nothing(&instance));
+}
+
+/// The orchestrator that [`a_restarted_orchestrator_reattaches_to_its_vm`] runs in a process of
+/// its own: it starts the instance in the directory that [`ORCHESTRATOR_INSTANCE`] names, with the
+/// fake guest artifacts of its working directory, and exits, leaving the VM running.
+#[test]
+#[ignore = "an orchestrator that the tests run in a process of its own"]
+fn orchestrator_role() {
+    let Some(dir) = env::var_os(ORCHESTRATOR_INSTANCE) else {
+        return;
+    };
+    let spec = spec(&env::current_dir().unwrap());
+    let instance = Instance::create(PathBuf::from(dir), "test").unwrap();
+    start(&instance, &spec).unwrap();
+}
+
+#[test]
+fn a_restarted_orchestrator_reattaches_to_its_vm() {
+    let directory = tempfile::tempdir().unwrap();
+    let dir = directory.path().join("vm");
+    let status = Command::new(env::current_exe().unwrap())
+        .args([
+            "--exact",
+            "orchestrator_role",
+            "--ignored",
+            "--nocapture",
+            "--test-threads=1",
+        ])
+        .current_dir(directory.path())
+        .env(ORCHESTRATOR_INSTANCE, &dir)
+        .stdin(Stdio::null())
+        .status()
+        .unwrap();
+    assert!(status.success(), "the orchestrator failed: {status}");
+
+    // The orchestrator restarts within the same host boot: it finds the VM that its earlier run
+    // started, through the records of the store, and drives it.
+    let instance = Instance::open(&dir, "test").unwrap();
+    let idle = AtomicBool::new(false);
+    let output = run(&instance, &workload(&["/bin/echo", "reattached"]), &idle);
+    assert_eq!(output.outcome, WorkloadOutcome::Exited(0));
+    assert_eq!(output.stdout, b"reattached\n");
+
+    // Under another runtime identity, as after an upgrade of OpenVMM, the VM is mismatched: it is
+    // reported, and neither driven nor stopped.
+    {
+        let mut locked = instance.lock(None).unwrap();
+        let Found::Mismatched(mismatched) = locked.find(|| Ok(runtime_with('9'))).unwrap() else {
+            panic!("a VM of another runtime identity was not reported");
+        };
+        assert_eq!(mismatched.differences(), [IdentityPart::OpenVmm]);
+        let error = mismatched.error();
+        assert!(
+            error.message().starts_with(
+                "sandbox test runs under another runtime identity, which differs in OpenVMM"
+            ),
+            "{error}"
+        );
+    }
+    assert_eq!(
+        run(&instance, &workload(&["/bin/echo", "still"]), &idle).stdout,
+        b"still\n"
+    );
+    let stopped = stop(&instance, TIMEOUT).unwrap();
+    assert!(!stopped.forced);
+    assert!(records_nothing(&instance));
 }

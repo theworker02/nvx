@@ -1,155 +1,76 @@
-//! Supervision of one VM instance: its OpenVMM process, its control endpoint, and the files that
-//! record them.
+//! Supervision of one VM instance: its OpenVMM process, its control endpoint, and the records
+//! that name them, through the [`store`](super::store), the [`supervisor`], and the control
+//! [`session`].
 //!
-//! An instance lives in a directory of its own, which the caller creates and keeps private to the
-//! current user:
+//! An instance lives in a [`SandboxStore`] of its own: a directory private to the current user,
+//! in which the store keeps the instance's lock, the journal of its launch, and the runtime
+//! record of its VM, and in which the caller may keep configuration records of its own under
+//! other names:
 //!
 //! ```text
 //! <dir>/
-//!   launch.json             endpoint and available process identity of a start in progress
-//!   runtime.json            OpenVMM process identity and endpoint (running only)
+//!   sandbox.lock            the lock that serializes the instance's lifecycle transitions
+//!   launch.json             the journal of a start in progress, or of one that was interrupted
+//!   runtime.json            the runtime record of the running VM
 //!   control.capability      launch capability (running only)
 //!   control.sock            Linux control endpoint (running only)
 //!   openvmm.log             OpenVMM output of the latest start
 //!   outcome.json            OpenVMM outcome report of the latest run
 //! ```
 //!
-//! - [`Instance::start`] launches a detached OpenVMM process with the managed lifecycle, passes it
-//!   a fresh 32-byte capability through standard input, and waits until the guest agent answers
-//!   on the authenticated control console. The agent must also advertise the control features in
-//!   [`GuestFeatures::REQUIRED`]; a guest image that lacks one is terminated, because it would
-//!   silently ignore the policy or request that needs the feature. Start then hands the agent the
-//!   table of mapped host paths, and fails if the agent cannot mount them all.
-//! - [`Instance::exec`] runs a workload through the control console, and [`Execution::pump`]
-//!   streams its output live.
-//! - [`Instance::stop`] asks the guest to shut down and falls back to terminating OpenVMM.
-//! - [`Instance::reconcile`] compares the recorded OpenVMM process with the host, so that every
-//!   operation can run in a different process. A VM that died leaves the instance stopped, and a
-//!   start whose caller died before recording OpenVMM's identity is recovered through its launch
-//!   marker.
+//! Lifecycle transitions run under the instance's lock, through the [`LockedInstance`] that
+//! [`Instance::lock`] returns, so that every operation can run in a different process:
 //!
-//! Callers serialize the lifecycle transitions of one instance, for example with [`lock`]. The
-//! guest serializes executions: a second execution waits until the first finishes. Messages call
-//! the instance `sandbox NAME`, after the name that [`Instance::new`] gives it.
+//! - [`LockedInstance::find`] finds the instance's VM as an orchestrator does after it restarts
+//!   within the same host boot, with [`supervisor::reattach`]: it ends a start whose caller died,
+//!   forgets a VM that exited, and compares the caller's runtime identity with the one that a
+//!   running VM was launched with. A VM of another runtime identity is [`Found::Mismatched`]: it
+//!   runs through artifacts or contracts that the caller does not have, so the instance does not
+//!   drive it.
+//! - [`LockedInstance::start`] launches a detached OpenVMM process with the managed lifecycle
+//!   through [`supervisor::launch`], passes it a fresh 32-byte capability through standard input,
+//!   and waits until the guest agent answers on the authenticated control console. The agent must
+//!   also advertise the control features in [`GuestFeatures::REQUIRED`]; a guest image that lacks
+//!   one is terminated, because it would silently ignore the policy or request that needs the
+//!   feature. Start then hands the agent the table of mapped host paths, and fails if the agent
+//!   cannot mount them all.
+//! - [`LockedInstance::stop`] asks the guest to shut down and falls back to terminating OpenVMM
+//!   through its verified process identity.
+//!
+//! [`Instance::exec`] runs a workload through the control console of a [`Running`] VM without the
+//! lock, and [`Execution::pump`] streams its output live. The guest serializes executions: a
+//! second execution waits until the first finishes. Messages call the instance `sandbox NAME`,
+//! after the name that [`Instance::create`] or [`Instance::open`] gives it.
 
-use std::fs::{self, File, OpenOptions};
+use std::fmt;
+use std::fs::{self, OpenOptions};
 use std::io::{self, Write};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
 
+use serde::Serialize;
 use serde::de::DeserializeOwned;
-use serde::{Deserialize, Serialize};
 
 use super::artifacts::Artifacts;
 use super::launch::{LaunchSpec, timeout_problem};
+use super::platform;
+use super::process::KILL_TIMEOUT;
 use super::report::{self, Report};
 use super::session::{self, ControlSession, ExecEvent, SessionError};
-use super::{platform, process};
+use super::store::{
+    IdentityPart, LockedStore, OUTCOME_NAME, Recovery, RuntimeIdentity, RuntimeRecord, SOCKET_NAME,
+    SandboxStore,
+};
+use super::supervisor::{self, Reattached, Starting, StopOutcome, Vmm, VmmCommand};
 use crate::error::{Error, ErrorKind, Result};
 use crate::protocol::{
     CAPABILITY_LEN, CWD_FAILED, ExitCategory, GuestFeatures, LAUNCH_FAILED, MAPPINGS_INCOMPLETE,
     MAX_OUTPUT_BYTES, Workload,
 };
 
-/// Version of the state files written by this crate: the launch marker and the runtime record,
-/// and the [`ExportPlan`](super::filesystem::ExportPlan) that callers record beside them.
-///
-/// Version 1 described sandboxes assembled from image layers and a scratch disk, and version 2
-/// exported the mapped host paths as one directory whose bind mounts the kernel command line
-/// listed.
-pub const STATE_FORMAT: u32 = 3;
-/// Linux control socket name.
-pub const SOCKET_NAME: &str = "control.sock";
-/// Name of the launch marker.
-pub const LAUNCH_NAME: &str = "launch.json";
-/// Name of the runtime record.
-pub const RUNTIME_NAME: &str = "runtime.json";
-/// Name of the file that holds the launch capability.
-pub const CAPABILITY_NAME: &str = "control.capability";
-/// Name of OpenVMM's log.
-pub const LOG_NAME: &str = "openvmm.log";
-/// Name of OpenVMM's outcome report.
-pub const REPORT_NAME: &str = "outcome.json";
-/// Every file that an instance keeps in its directory.
-pub const FILE_NAMES: [&str; 6] = [
-    RUNTIME_NAME,
-    LAUNCH_NAME,
-    CAPABILITY_NAME,
-    SOCKET_NAME,
-    REPORT_NAME,
-    LOG_NAME,
-];
-
 /// Longest delay between a cancellation request and its delivery to the guest.
 const CANCEL_POLL_INTERVAL: Duration = Duration::from_millis(20);
-
-/// Identity of an OpenVMM process: its ID and start time, which together never repeat.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase", deny_unknown_fields)]
-pub struct ProcessIdentity {
-    /// Process ID.
-    pub pid: u32,
-    /// Start time, in the units of [`platform::process_start_time`].
-    pub start_time: u64,
-}
-
-/// Identity of the OpenVMM process of a running instance, and its control endpoint.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase", deny_unknown_fields)]
-pub struct RuntimeRecord {
-    /// [`STATE_FORMAT`].
-    pub format: u32,
-    /// Process ID.
-    pub pid: u32,
-    /// Start time, in the units of [`platform::process_start_time`].
-    pub start_time: u64,
-    /// Control endpoint: a Unix socket path on Linux, and a named pipe on Windows.
-    pub endpoint: String,
-}
-
-/// Marker written before OpenVMM is launched and replaced by the runtime record afterwards.
-///
-/// Process identity is added as soon as the child is identified, before writing runtime state.
-/// A marker without identity is never expired: its child may be alive without an endpoint.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase", deny_unknown_fields)]
-pub struct LaunchRecord {
-    /// [`STATE_FORMAT`].
-    pub format: u32,
-    /// Control endpoint that the launch chose.
-    pub endpoint: String,
-    /// Identity of the launched process, once known.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub process: Option<ProcessIdentity>,
-}
-
-/// Held advisory lock. Dropping it releases the lock.
-#[derive(Debug)]
-pub struct LockGuard {
-    /// Open locked file whose lifetime holds the operating-system lock.
-    _file: File,
-}
-
-/// Takes the exclusive advisory lock of the file at `path`, creating the file if needed, and
-/// waits until no other holder has it.
-pub fn lock(path: &Path) -> Result<LockGuard> {
-    let file = OpenOptions::new()
-        .read(true)
-        .write(true)
-        .create(true)
-        .truncate(false)
-        .open(path)
-        .map_err(io_error(format!("cannot open lock {}", path.display())))?;
-    file.lock()
-        .map_err(io_error(format!("cannot lock {}", path.display())))?;
-    Ok(LockGuard { _file: file })
-}
-
-/// Creates the directory at `path` if needed and restricts it to the current user.
-pub fn create_private_dir(path: &Path) -> io::Result<()> {
-    platform::create_private_dir(path)
-}
 
 /// Builds an error mapper that preserves an I/O source under `context`.
 fn io_error(context: String) -> impl FnOnce(io::Error) -> Error {
@@ -165,7 +86,8 @@ fn private_options() -> OpenOptions {
     options
 }
 
-/// Atomically replaces `path` with `contents`, readable only by the current user.
+/// Atomically replaces `path` with `contents`, readable only by the current user, as callers do
+/// with the configuration records that they keep beside an instance's store.
 pub fn write_private(path: &Path, contents: &[u8]) -> Result<()> {
     let mut suffix = [0u8; 8];
     getrandom::fill(&mut suffix)
@@ -230,6 +152,29 @@ pub fn generate_capability() -> Result<[u8; CAPABILITY_LEN]> {
     Ok(capability)
 }
 
+/// Returns a control endpoint of an instance whose Linux control socket is `socket`: the socket
+/// on Linux, and a fresh named pipe, whose name always has the same length, on Windows, as a
+/// launch chooses it.
+fn control_endpoint(socket: &Path) -> Result<String> {
+    platform::control_endpoint(socket)
+        .map_err(|error| Error::io("cannot choose a control endpoint").with_source(error))
+}
+
+/// Fails with [`ErrorKind::Unsupported`] if OpenVMM's command line for `spec`, launched for an
+/// instance in the directory `dir`, would not fit the limit of a Windows process command line;
+/// see [`LaunchSpec::check_process_command_line`].
+///
+/// The directory need not exist yet, so that a caller can check a launch before it creates the
+/// instance. Every control endpoint of an instance has the same length.
+pub fn check_launch(dir: &Path, spec: &LaunchSpec) -> Result<()> {
+    let dir = std::path::absolute(dir).map_err(io_error(format!(
+        "cannot resolve the instance directory {}",
+        dir.display()
+    )))?;
+    let endpoint = control_endpoint(&dir.join(SOCKET_NAME))?;
+    spec.check_process_command_line(&endpoint, &dir.join(OUTCOME_NAME))
+}
+
 /// Classifies a session failure.
 fn session_kind(error: &SessionError) -> ErrorKind {
     match error {
@@ -260,16 +205,17 @@ fn readiness_failure(error: &SessionError, runs_as_host_user: bool) -> String {
     reason
 }
 
-/// A VM that [`Instance::start`] launched and the guest agent of which is ready.
+/// A VM that [`LockedInstance::start`] launched and the guest agent of which is ready.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Started {
-    /// The recorded identity and endpoint of its OpenVMM process.
+    /// The runtime record of its launch: its OpenVMM process, its control endpoint, and the
+    /// runtime identity that it was launched with.
     pub runtime: RuntimeRecord,
     /// Time from launch to guest readiness.
     pub boot: Duration,
 }
 
-/// A VM that [`Instance::stop`] stopped.
+/// A VM that [`LockedInstance::stop`] stopped.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Stopped {
     /// Whether OpenVMM had to be terminated because the guest did not shut down in time.
@@ -278,27 +224,125 @@ pub struct Stopped {
     pub report: Option<Report>,
 }
 
-/// One VM instance in a directory of its own.
+/// The running VM of an instance, which [`LockedInstance::find`] found under the caller's runtime
+/// identity, and the capability with which its control sessions attach.
+pub struct Running {
+    /// The VM, held through its verified process identity.
+    vmm: Vmm,
+    /// The launch capability of the VM.
+    capability: [u8; CAPABILITY_LEN],
+}
+
+impl Running {
+    /// Returns the VM, held through its verified process identity.
+    pub fn vmm(&self) -> &Vmm {
+        &self.vmm
+    }
+
+    /// Returns the runtime record of the VM's launch.
+    pub fn runtime(&self) -> &RuntimeRecord {
+        self.vmm.record()
+    }
+}
+
+impl fmt::Debug for Running {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        // The capability authenticates control sessions, so it is never shown.
+        formatter
+            .debug_struct("Running")
+            .field("vmm", &self.vmm)
+            .finish_non_exhaustive()
+    }
+}
+
+/// The running VM of an instance, which [`LockedInstance::find`] found under another runtime
+/// identity than the caller's.
+#[derive(Debug)]
+pub struct Mismatched {
+    /// The instance's name in messages.
+    name: String,
+    /// The VM, held through its verified process identity.
+    vmm: Vmm,
+    /// The parts of the runtime identity that differ.
+    differences: Vec<IdentityPart>,
+}
+
+impl Mismatched {
+    /// Returns the VM, held through its verified process identity.
+    pub fn vmm(&self) -> &Vmm {
+        &self.vmm
+    }
+
+    /// Returns the parts of the runtime identity that differ, as
+    /// [`RuntimeIdentity::differences`] returns them.
+    pub fn differences(&self) -> &[IdentityPart] {
+        &self.differences
+    }
+
+    /// Returns the error that reports the VM, which the instance does not drive: only the build
+    /// and artifacts that started it speak its contracts.
+    pub fn error(&self) -> Error {
+        let parts: Vec<&str> = self.differences.iter().map(|part| part.name()).collect();
+        Error::other(format!(
+            "sandbox {} runs under another runtime identity, which differs in {}, so it is not \
+             driven: stop it with the NVX build and artifacts that started it (OpenVMM process {})",
+            self.name,
+            parts.join(", "),
+            self.vmm.record().process().pid
+        ))
+    }
+}
+
+/// What [`LockedInstance::find`] found of an instance's VM.
+#[derive(Debug)]
+pub enum Found {
+    /// No VM of the instance runs: none was started, the last one stopped or exited, or a start
+    /// that was interrupted is over.
+    Stopped,
+    /// The VM runs under the caller's runtime identity.
+    Running(Running),
+    /// The VM runs under another runtime identity, which the caller reports, as
+    /// [`Mismatched::error`] does.
+    Mismatched(Mismatched),
+}
+
+/// One VM instance in a sandbox store of its own.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Instance {
-    /// Private directory containing runtime state, logs, and the control endpoint.
-    dir: PathBuf,
+    /// The store of the instance's runtime records, logs, and control endpoint.
+    store: SandboxStore,
     /// Sandbox name used in diagnostics.
     name: String,
 }
 
 impl Instance {
-    /// Supervises the instance in `dir`, which messages call `sandbox NAME`.
-    pub fn new(dir: impl Into<PathBuf>, name: impl Into<String>) -> Self {
-        Self {
-            dir: dir.into(),
+    /// Creates the directory `dir` of a new instance, whose parent must exist, private to the
+    /// current user, as [`SandboxStore::create`] does, and supervises the instance in it, which
+    /// messages call `sandbox NAME`.
+    pub fn create(dir: impl Into<PathBuf>, name: impl Into<String>) -> Result<Self> {
+        Ok(Self {
+            store: SandboxStore::create(dir)?,
             name: name.into(),
-        }
+        })
     }
 
-    /// Returns the instance's directory.
+    /// Supervises the instance in the existing directory `dir`, which must be private to the
+    /// current user, as [`SandboxStore::open`] requires, and which messages call `sandbox NAME`.
+    pub fn open(dir: impl Into<PathBuf>, name: impl Into<String>) -> Result<Self> {
+        Ok(Self {
+            store: SandboxStore::open(dir)?,
+            name: name.into(),
+        })
+    }
+
+    /// Returns the store of the instance's runtime records.
+    pub fn store(&self) -> &SandboxStore {
+        &self.store
+    }
+
+    /// Returns the instance's directory, as an absolute path.
     pub fn dir(&self) -> &Path {
-        &self.dir
+        self.store.dir()
     }
 
     /// Returns the instance's name in messages.
@@ -308,196 +352,21 @@ impl Instance {
 
     /// Returns the path of the OpenVMM log of the latest start.
     pub fn log_path(&self) -> PathBuf {
-        self.dir.join(LOG_NAME)
+        self.store.log_path()
     }
 
     /// Returns the path of OpenVMM's outcome report of the latest run.
     pub fn report_path(&self) -> PathBuf {
-        self.dir.join(REPORT_NAME)
+        self.store.outcome_path()
     }
 
-    /// Returns the path of the Linux control socket.
-    pub fn socket_path(&self) -> PathBuf {
-        self.dir.join(SOCKET_NAME)
-    }
-
-    /// Returns a control endpoint for the instance: its socket on Linux, and a fresh named pipe,
-    /// whose name always has the same length, on Windows.
-    fn endpoint(&self) -> Result<String> {
-        platform::control_endpoint(&self.socket_path())
-            .map_err(|error| Error::io("cannot choose a control endpoint").with_source(error))
-    }
-
-    /// Reads the runtime record, if the instance runs.
-    pub fn runtime(&self) -> Result<Option<RuntimeRecord>> {
-        let path = self.dir.join(RUNTIME_NAME);
-        let runtime: Option<RuntimeRecord> = read_json(&path)?;
-        match runtime {
-            Some(runtime) if runtime.format != STATE_FORMAT => Err(Error::io(format!(
-                "sandbox runtime state {} has an unsupported format",
-                path.display()
-            ))),
-            runtime => Ok(runtime),
-        }
-    }
-
-    /// Records the OpenVMM process of a running instance.
-    pub fn write_runtime(&self, runtime: &RuntimeRecord) -> Result<()> {
-        write_json(&self.dir.join(RUNTIME_NAME), runtime)
-    }
-
-    /// Records a launch in progress.
-    pub fn write_launch(&self, launch: &LaunchRecord) -> Result<()> {
-        write_json(&self.dir.join(LAUNCH_NAME), launch)
-    }
-
-    /// Reads the marker of a launch in progress, if any.
-    pub fn launch(&self) -> Result<Option<LaunchRecord>> {
-        let path = self.dir.join(LAUNCH_NAME);
-        let Some(launch) = read_json::<LaunchRecord>(&path)? else {
-            return Ok(None);
-        };
-        if launch.format != STATE_FORMAT {
-            return Err(Error::io(format!(
-                "sandbox launch marker {} has an unsupported format",
-                path.display()
-            )));
-        }
-        Ok(Some(launch))
-    }
-
-    /// Removes the launch marker once the runtime record replaces it.
-    pub fn remove_launch(&self) {
-        let _ = fs::remove_file(self.dir.join(LAUNCH_NAME));
-    }
-
-    /// Stores the launch capability, readable only by the current user.
-    pub fn write_capability(&self, capability: &[u8; CAPABILITY_LEN]) -> Result<()> {
-        write_private(&self.dir.join(CAPABILITY_NAME), capability)
-    }
-
-    /// Reads the launch capability of a running instance.
-    pub fn read_capability(&self) -> Result<[u8; CAPABILITY_LEN]> {
-        let path = self.dir.join(CAPABILITY_NAME);
-        let bytes = fs::read(&path).map_err(io_error(format!(
-            "cannot read the sandbox control capability {}",
-            path.display()
-        )))?;
-        match <[u8; CAPABILITY_LEN]>::try_from(bytes.as_slice()) {
-            Ok(capability) if capability != [0; CAPABILITY_LEN] => Ok(capability),
-            _ => Err(Error::io(format!(
-                "sandbox control capability {} is invalid",
-                path.display()
-            ))),
-        }
-    }
-
-    /// Removes the files that exist only while the instance starts or runs.
-    pub fn clear_runtime(&self) -> Result<()> {
-        for name in [RUNTIME_NAME, LAUNCH_NAME, CAPABILITY_NAME, SOCKET_NAME] {
-            remove_if_present(&self.dir.join(name))?;
-        }
-        Ok(())
-    }
-
-    /// Opens a fresh OpenVMM log, replacing the previous one.
-    pub fn create_log(&self) -> Result<File> {
-        let path = self.log_path();
-        private_options()
-            .truncate(true)
-            .open(&path)
-            .map_err(io_error(format!("cannot create {}", path.display())))
-    }
-
-    /// Fails with [`ErrorKind::Unsupported`] if OpenVMM's command line for `spec` would not fit
-    /// the limit of a Windows process command line; see
-    /// [`LaunchSpec::check_process_command_line`].
-    pub fn check_launch(&self, spec: &LaunchSpec) -> Result<()> {
-        spec.check_process_command_line(&self.endpoint()?, &self.report_path())
-    }
-
-    /// Returns the runtime record of the instance's OpenVMM process if it still runs, clearing
-    /// stale runtime state otherwise.
-    ///
-    /// State is cleared only when the process is definitely gone; an inconclusive check fails
-    /// instead, so a live VM is never forgotten. A start whose caller died before recording
-    /// OpenVMM's identity is recovered through its launch marker. Callers hold the instance's
-    /// lifecycle lock.
-    pub fn reconcile(&self) -> Result<Option<RuntimeRecord>> {
-        if let Some(runtime) = self.runtime()? {
-            let current = platform::process_start_time(runtime.pid).map_err(|error| {
-                Error::io(format!(
-                    "cannot determine whether OpenVMM process {} of sandbox {} is running",
-                    runtime.pid, self.name
-                ))
-                .with_source(error)
-            })?;
-            if current == Some(runtime.start_time) {
-                self.remove_launch();
-                return Ok(Some(runtime));
-            }
-            self.clear_runtime()?;
-            return Ok(None);
-        }
-        if let Some(launch) = self.launch()? {
-            self.recover_launch(&launch)?;
-            self.clear_runtime()?;
-        }
-        Ok(None)
-    }
-
-    /// Terminates the OpenVMM process of a start whose caller died before recording it.
-    ///
-    /// Lifecycle locks serialize starts, so a launch marker seen under the lock always belongs
-    /// to an interrupted start. Recorded identity is authoritative even before an endpoint
-    /// exists; legacy markers can be recovered only when their endpoint identifies the child.
-    fn recover_launch(&self, launch: &LaunchRecord) -> Result<()> {
-        let interrupted = |kind: ErrorKind, detail: &str| {
-            Error::new(
-                kind,
-                format!("an interrupted start of sandbox {} {detail}", self.name),
-            )
-        };
-        let identity = match &launch.process {
-            Some(identity) => identity.clone(),
-            None => {
-                let pid = platform::endpoint_server_pid(&launch.endpoint).map_err(|error| {
-                    interrupted(ErrorKind::Io, "cannot be recovered yet").with_source(error)
-                })?;
-                let Some(pid) = pid else {
-                    return Err(interrupted(
-                        ErrorKind::Other,
-                        "has no recorded process identity or observable endpoint; cannot verify \
-                         that OpenVMM exited, so the launch marker is retained",
-                    ));
-                };
-                let Some(start_time) = platform::process_start_time(pid).map_err(|error| {
-                    interrupted(ErrorKind::Io, "cannot be recovered yet").with_source(error)
-                })?
-                else {
-                    return Ok(());
-                };
-                ProcessIdentity { pid, start_time }
-            }
-        };
-        match process::kill(identity.pid, identity.start_time) {
-            Ok(true) => Ok(()),
-            Ok(false) => Err(interrupted(
-                ErrorKind::Other,
-                &format!(
-                    "left OpenVMM process {} running, and it did not exit",
-                    identity.pid
-                ),
-            )),
-            Err(error) => Err(interrupted(
-                ErrorKind::Io,
-                &format!(
-                    "left OpenVMM process {} running, and it could not be terminated",
-                    identity.pid
-                ),
-            )
-            .with_source(error)),
-        }
+    /// Takes the instance's lock, which serializes its lifecycle transitions, waiting for it
+    /// until `deadline`, or for as long as it takes without one, as [`SandboxStore::lock`] does.
+    pub fn lock(&self, deadline: Option<Instant>) -> Result<LockedInstance> {
+        Ok(LockedInstance {
+            locked: self.store.lock(deadline)?,
+            instance: self.clone(),
+        })
     }
 
     /// Describes why this instance did not start and points the caller to its log.
@@ -512,177 +381,37 @@ impl Instance {
         )
     }
 
-    /// Terminates a launch that did not become ready.
+    /// Ends a launch that did not become ready, as [`Starting::abandon`] does, and describes why
+    /// the instance did not start.
     ///
-    /// Runtime state is cleared only once the process has exited. Otherwise the instance stays
-    /// marked as running so that a stop can retry instead of a second VM being started.
-    fn abort_start(&self, runtime: &RuntimeRecord, kind: ErrorKind, reason: &str) -> Error {
-        let cleanup = match process::kill(runtime.pid, runtime.start_time) {
-            Ok(true) => {
-                let _ = self.clear_runtime();
-                return self.start_failure(kind, reason);
-            }
-            Ok(false) => "it did not exit".to_owned(),
+    /// A launch whose OpenVMM cannot be ended keeps its journal, and the next transition of the
+    /// instance ends it, when [`LockedInstance::find`] recovers it.
+    fn abort_start(&self, starting: Starting<'_>, kind: ErrorKind, reason: &str) -> Error {
+        let unended = match starting.abandon() {
+            Ok(Recovery::Indeterminate(unended)) => unended,
+            Ok(_) => return self.start_failure(kind, reason),
             Err(error) => error.to_string(),
         };
         self.start_failure(
             kind,
             &format!(
-                "{reason}; OpenVMM process {} could not be terminated ({cleanup}), so the \
-                 sandbox stays marked as running until it is stopped",
-                runtime.pid
+                "{reason}; the launch could not be ended, and remains for recovery: {unended}"
             ),
         )
     }
 
-    /// Terminates a launch whose guest image lacks control features that NVX needs.
+    /// Ends a launch whose guest image lacks control features that NVX needs.
     ///
     /// An older image would boot and answer, but it would silently ignore host path mappings and
     /// cancellation requests, so the VM must not run at all.
-    fn reject_guest(&self, runtime: &RuntimeRecord, missing: &[&str]) -> Error {
+    fn reject_guest(&self, starting: Starting<'_>, missing: &[&str]) -> Error {
         let reason = format!(
             "the guest image lacks control features that the openvmm backend needs ({}); use an \
              NVX release or build that includes them, for example through {}",
             missing.join(", "),
             Artifacts::ENV_DIR
         );
-        self.abort_start(runtime, ErrorKind::Unavailable, &reason)
-    }
-
-    /// Launches the VM that `spec` describes and waits up to `timeout` until its guest is ready.
-    ///
-    /// The instance's directory must exist, and the caller holds its lifecycle lock and has found
-    /// it stopped with [`reconcile`](Self::reconcile). Start first checks that the mapped host
-    /// paths still name the objects they named when they were planned; see
-    /// [`ExportPlan::verify`](super::filesystem::ExportPlan::verify).
-    ///
-    /// The capability travels through OpenVMM's standard-input pipe, which is closed before
-    /// OpenVMM starts, and never appears in arguments, the environment, or the log. Before
-    /// launching OpenVMM, start records the control endpoint in the launch marker, so that
-    /// [`reconcile`](Self::reconcile) can terminate an OpenVMM whose start was interrupted.
-    ///
-    /// Fails with [`ErrorKind::Unavailable`] when the guest image lacks a feature in
-    /// [`GuestFeatures::REQUIRED`], and with [`ErrorKind::Unsupported`] when `timeout` is zero or
-    /// longer than [`MAX_TIMEOUT`](super::launch::MAX_TIMEOUT), when the specification fails
-    /// [`LaunchSpec::check`] or exceeds a limit, or when OpenVMM's command line would not fit
-    /// [`PROCESS_COMMAND_LINE_LIMIT`](super::launch::PROCESS_COMMAND_LINE_LIMIT), which holds on
-    /// every host. Unlike [`check_launch`](Self::check_launch), start keeps no reserve. A launch
-    /// that does not become ready is terminated; if it cannot be, the instance stays marked as
-    /// running until it is stopped.
-    pub fn start(&self, spec: &LaunchSpec, timeout: Duration) -> Result<Started> {
-        check_timeout("start timeout", timeout, true)?;
-        if let Some(plan) = &spec.filesystem {
-            plan.verify()?;
-        }
-        let capability = generate_capability()?;
-        let socket = self.socket_path();
-        remove_if_present(&socket)?;
-        let endpoint = self.endpoint()?;
-        let report = self.report_path();
-        remove_if_present(&report)?;
-        let arguments = spec.openvmm_arguments(&endpoint, &report)?;
-        spec.fit_process_command_line(&arguments, 0)?;
-
-        self.write_capability(&capability)?;
-        let log = self.create_log()?;
-        // Until the child is identified, recovery must retain this marker unless the endpoint
-        // identifies the child. An absent endpoint never proves that a launch has exited.
-        self.write_launch(&LaunchRecord {
-            format: STATE_FORMAT,
-            endpoint: endpoint.clone(),
-            process: None,
-        })?;
-        let started = Instant::now();
-        let child = match process::spawn(
-            &spec.openvmm,
-            spec.breakaway_from_job,
-            &arguments,
-            &capability,
-            log,
-            &self.dir,
-        ) {
-            Ok(child) => child,
-            Err(error) => {
-                let _ = self.clear_runtime();
-                return Err(
-                    Error::io(format!("cannot launch {}", spec.openvmm.display()))
-                        .with_source(error),
-                );
-            }
-        };
-        let pid = child.id();
-        let start_time = match platform::process_start_time(pid) {
-            Ok(Some(start_time)) => start_time,
-            outcome => {
-                // Keep the launch marker unless OpenVMM is gone, so recovery can retry.
-                if process::kill_child(child) {
-                    let _ = self.clear_runtime();
-                }
-                let (kind, reason) = match outcome {
-                    Err(error) => (
-                        ErrorKind::Io,
-                        format!("cannot identify the OpenVMM process: {error}"),
-                    ),
-                    _ => (
-                        ErrorKind::Exited,
-                        "OpenVMM exited during startup".to_owned(),
-                    ),
-                };
-                return Err(self.start_failure(kind, &reason));
-            }
-        };
-        let runtime = RuntimeRecord {
-            format: STATE_FORMAT,
-            pid,
-            start_time,
-            endpoint: endpoint.clone(),
-        };
-        let identified = LaunchRecord {
-            format: STATE_FORMAT,
-            endpoint: endpoint.clone(),
-            process: Some(ProcessIdentity { pid, start_time }),
-        };
-        if let Err(error) = self
-            .write_launch(&identified)
-            .and_then(|()| self.write_runtime(&runtime))
-        {
-            if process::kill_child(child) {
-                let _ = self.clear_runtime();
-            }
-            return Err(error);
-        }
-        process::detach_child(child);
-        self.remove_launch();
-        let deadline = started + timeout;
-        let ready = session::connect(&endpoint, pid, start_time, deadline)
-            .and_then(|transport| ControlSession::attach(transport, &capability, deadline))
-            .and_then(|mut session| {
-                session.ping(deadline)?;
-                let features = session.features(deadline)?;
-                Ok((session, features))
-            });
-        let (mut session, features) = match ready {
-            Ok(ready) => ready,
-            Err(error) => {
-                let reason = readiness_failure(&error, spec.identity.create_account);
-                return Err(self.abort_start(&runtime, session_kind(&error), &reason));
-            }
-        };
-        let missing = features.missing(GuestFeatures::REQUIRED);
-        if !missing.is_empty() {
-            return Err(self.reject_guest(&runtime, &missing));
-        }
-        // Workloads run only once the guest has mounted every mapped host path.
-        if let Some(plan) = &spec.filesystem
-            && let Err(error) = session.map_host_paths(&plan.guest_table(), deadline)
-        {
-            let reason = format!("the host paths were not mapped: {error}");
-            return Err(self.abort_start(&runtime, session_kind(&error), &reason));
-        }
-        Ok(Started {
-            runtime,
-            boot: started.elapsed(),
-        })
+        self.abort_start(starting, ErrorKind::Unavailable, &reason)
     }
 
     /// Maps a control-session failure onto an instance-facing error and message.
@@ -708,8 +437,7 @@ impl Instance {
         }
     }
 
-    /// Starts `workload` in the running instance whose OpenVMM process `runtime` records, with
-    /// the `capability` that it was launched with.
+    /// Starts `workload` in the instance's running VM, `running`, without the instance's lock.
     ///
     /// It waits up to `control_timeout` for the control session, which the guest grants one
     /// execution at a time. [`Execution::pump`] then waits for the outcome up to the workload's
@@ -719,8 +447,7 @@ impl Instance {
     /// than [`MAX_TIMEOUT`](super::launch::MAX_TIMEOUT).
     pub fn exec(
         &self,
-        runtime: &RuntimeRecord,
-        capability: &[u8; CAPABILITY_LEN],
+        running: &Running,
         workload: &Workload<'_>,
         control_timeout: Duration,
         response_grace: Duration,
@@ -728,10 +455,15 @@ impl Instance {
         check_timeout("control timeout", control_timeout, true)?;
         check_timeout("response grace", response_grace, false)?;
         let deadline = Instant::now() + control_timeout;
-        let mut session =
-            session::connect(&runtime.endpoint, runtime.pid, runtime.start_time, deadline)
-                .and_then(|transport| ControlSession::attach(transport, capability, deadline))
-                .map_err(|error| self.session_error(error, control_timeout))?;
+        let process = running.vmm.record().process();
+        let mut session = session::connect(
+            running.vmm.endpoint(),
+            process.pid,
+            process.start_time,
+            deadline,
+        )
+        .and_then(|transport| ControlSession::attach(transport, &running.capability, deadline))
+        .map_err(|error| self.session_error(error, control_timeout))?;
         let request_id = session
             .start_exec(workload, deadline)
             .map_err(|error| self.session_error(error, control_timeout))?;
@@ -745,48 +477,186 @@ impl Instance {
             control_timeout,
         })
     }
+}
 
-    /// Asks the guest of the running instance that `runtime` records to shut down, and
-    /// terminates OpenVMM if it has not exited within `timeout`.
+/// An instance whose lock this holds, through which its lifecycle transitions change its
+/// records. Dropping it releases the lock.
+#[derive(Debug)]
+pub struct LockedInstance {
+    /// The instance.
+    instance: Instance,
+    /// Its locked store.
+    locked: LockedStore,
+}
+
+impl LockedInstance {
+    /// Returns the instance.
+    pub fn instance(&self) -> &Instance {
+        &self.instance
+    }
+
+    /// Finds the instance's VM with [`supervisor::reattach`], under the runtime identity that
+    /// `runtime` returns: the one with which the caller would launch it now.
     ///
-    /// A running execution keeps the control session until it ends, so a stop that cannot reach
-    /// the guest in time terminates the VM, and the execution then fails. Stop reads OpenVMM's
-    /// outcome report and clears the runtime state. Fails with [`ErrorKind::Unsupported`] when
-    /// `timeout` is zero or longer than [`MAX_TIMEOUT`](super::launch::MAX_TIMEOUT).
-    pub fn stop(&self, runtime: &RuntimeRecord, timeout: Duration) -> Result<Stopped> {
-        check_timeout("stop timeout", timeout, true)?;
-        let deadline = Instant::now() + timeout;
-        let graceful = (|| -> std::result::Result<(), SessionError> {
-            let capability = self
-                .read_capability()
-                .map_err(|error| SessionError::Protocol(error.to_string()))?;
-            let transport =
-                session::connect(&runtime.endpoint, runtime.pid, runtime.start_time, deadline)?;
-            let mut session = ControlSession::attach(transport, &capability, deadline)?;
-            session.stop(deadline)?;
-            drop(session);
-            if process::wait_for_exit(runtime.pid, runtime.start_time, deadline) {
-                Ok(())
-            } else {
-                Err(SessionError::TimedOut)
-            }
-        })();
-        let forced = !matches!(graceful, Ok(()) | Err(SessionError::ProcessExited));
-        if forced {
-            let exited = process::kill(runtime.pid, runtime.start_time).map_err(|error| {
-                Error::io(format!("cannot terminate OpenVMM process {}", runtime.pid))
-                    .with_source(error)
-            })?;
-            if !exited {
+    /// `runtime` is asked only when the store records a VM or a start, so that an instance that
+    /// never started, or that stopped, needs no runtime identity. Reattach ends a start that was
+    /// interrupted, signaling only an OpenVMM process that it verified, and forgets a VM that
+    /// exited, as one that a record of an earlier host boot names has. Fails as `runtime` fails,
+    /// for records that the store does not read, such as those of an earlier format, whose
+    /// message names it, and when whether the VM runs cannot be determined, because an
+    /// interrupted start cannot be ended yet or the recorded process cannot be examined: the
+    /// records then remain for a later attempt.
+    pub fn find(&mut self, runtime: impl FnOnce() -> Result<RuntimeIdentity>) -> Result<Found> {
+        if self.locked.journal()?.is_none() && self.locked.runtime()?.is_none() {
+            return Ok(Found::Stopped);
+        }
+        let runtime = runtime()?;
+        Ok(match supervisor::reattach(&mut self.locked, &runtime)? {
+            Reattached::Live(vmm) => Found::Running(Running {
+                vmm,
+                capability: self.locked.read_capability()?,
+            }),
+            Reattached::Mismatched { vmm, differences } => Found::Mismatched(Mismatched {
+                name: self.instance.name.clone(),
+                vmm,
+                differences,
+            }),
+            Reattached::Exited { .. } => Found::Stopped,
+            Reattached::Indeterminate(reason) => {
                 return Err(Error::other(format!(
-                    "OpenVMM process {} did not terminate",
-                    runtime.pid
+                    "cannot determine whether the OpenVMM process of sandbox {} runs: {reason}",
+                    self.instance.name
                 )));
             }
+        })
+    }
+
+    /// Launches the VM that `spec` describes under the runtime identity `runtime`, and waits up
+    /// to `timeout` until its guest is ready.
+    ///
+    /// The caller has found the instance stopped with [`find`](Self::find). Start first checks
+    /// that the mapped host paths still name the objects they named when they were planned; see
+    /// [`ExportPlan::verify`](super::filesystem::ExportPlan::verify). It launches OpenVMM with
+    /// [`supervisor::launch`], whose journal records the launch before OpenVMM is spawned and its
+    /// process identity right after, so that [`find`](Self::find) ends a start whose caller died.
+    /// The capability travels through OpenVMM's standard-input pipe, which is closed before
+    /// OpenVMM starts, and never appears in arguments, the environment, or the log. Once the guest
+    /// is ready, has the required features, and has mounted the mapped host paths, start commits
+    /// the launch: the runtime record names the VM from then on.
+    ///
+    /// Fails with [`ErrorKind::Unavailable`] when the guest image lacks a feature in
+    /// [`GuestFeatures::REQUIRED`], and with [`ErrorKind::Unsupported`] when `timeout` is zero or
+    /// longer than [`MAX_TIMEOUT`](super::launch::MAX_TIMEOUT), when the specification fails
+    /// [`LaunchSpec::check`] or exceeds a limit, or when OpenVMM's command line would not fit
+    /// [`PROCESS_COMMAND_LINE_LIMIT`](super::launch::PROCESS_COMMAND_LINE_LIMIT), which holds on
+    /// every host; such a launch records nothing. Unlike [`check_launch`], start keeps no reserve.
+    /// A launch that does not become ready is terminated through its verified process identity;
+    /// one that cannot be ended keeps its journal, and the next transition ends it.
+    pub fn start(
+        &mut self,
+        spec: &LaunchSpec,
+        runtime: &RuntimeIdentity,
+        timeout: Duration,
+    ) -> Result<Started> {
+        check_timeout("start timeout", timeout, true)?;
+        if let Some(plan) = &spec.filesystem {
+            plan.verify()?;
         }
-        let report = report::read(&self.report_path());
-        self.clear_runtime()?;
-        Ok(Stopped { forced, report })
+        let instance = &self.instance;
+        let report = instance.report_path();
+        // Every control endpoint of the instance has the same length, so a launch that would not
+        // fit is refused before the store records it.
+        let endpoint = control_endpoint(&instance.store.socket_path())?;
+        spec.fit_process_command_line(&spec.openvmm_arguments(&endpoint, &report)?, 0)?;
+        let capability = generate_capability()?;
+        let started = Instant::now();
+        let starting = supervisor::launch(&mut self.locked, runtime, &capability, |endpoint| {
+            let arguments = spec.openvmm_arguments(endpoint, &report)?;
+            spec.fit_process_command_line(&arguments, 0)?;
+            let mut command = VmmCommand::new(&spec.openvmm, arguments, instance.dir());
+            command.breakaway_from_job = spec.breakaway_from_job;
+            Ok(command)
+        })?;
+        let (pid, start_time) = {
+            let reference = starting.process().reference();
+            (reference.pid, reference.start_time)
+        };
+        let deadline = started + timeout;
+        let ready = session::connect(starting.endpoint(), pid, start_time, deadline)
+            .and_then(|transport| ControlSession::attach(transport, &capability, deadline))
+            .and_then(|mut session| {
+                session.ping(deadline)?;
+                let features = session.features(deadline)?;
+                Ok((session, features))
+            });
+        let (mut session, features) = match ready {
+            Ok(ready) => ready,
+            Err(error) => {
+                let reason = readiness_failure(&error, spec.identity.create_account);
+                return Err(instance.abort_start(starting, session_kind(&error), &reason));
+            }
+        };
+        let missing = features.missing(GuestFeatures::REQUIRED);
+        if !missing.is_empty() {
+            drop(session);
+            return Err(instance.reject_guest(starting, &missing));
+        }
+        // Workloads run only once the guest has mounted every mapped host path.
+        if let Some(plan) = &spec.filesystem
+            && let Err(error) = session.map_host_paths(&plan.guest_table(), deadline)
+        {
+            drop(session);
+            let reason = format!("the host paths were not mapped: {error}");
+            return Err(instance.abort_start(starting, session_kind(&error), &reason));
+        }
+        drop(session);
+        let vmm = starting.commit()?;
+        Ok(Started {
+            runtime: vmm.record().clone(),
+            boot: started.elapsed(),
+        })
+    }
+
+    /// Asks the guest of the running VM `running` to shut down, and terminates OpenVMM through
+    /// its verified process identity if it has not exited within `timeout`, as [`Vmm::stop`]
+    /// does with a forced step.
+    ///
+    /// A running execution keeps the control session until it ends, so a stop that cannot reach
+    /// the guest in time terminates the VM, and the execution then fails. Once OpenVMM has
+    /// exited, the stop clears the runtime record and reads OpenVMM's outcome report. Fails with
+    /// [`ErrorKind::Unsupported`] when `timeout` is zero or longer than
+    /// [`MAX_TIMEOUT`](super::launch::MAX_TIMEOUT), and when OpenVMM cannot be terminated, or does
+    /// not exit after it was, which keeps its runtime record.
+    pub fn stop(&mut self, running: Running, timeout: Duration) -> Result<Stopped> {
+        check_timeout("stop timeout", timeout, true)?;
+        let deadline = Instant::now() + timeout;
+        let Running { vmm, capability } = running;
+        let stopped = vmm.stop(
+            &mut self.locked,
+            deadline,
+            Some(KILL_TIMEOUT),
+            |vmm, deadline| {
+                let process = vmm.record().process();
+                let transport =
+                    session::connect(vmm.endpoint(), process.pid, process.start_time, deadline)?;
+                ControlSession::attach(transport, &capability, deadline)?.stop(deadline)
+            },
+        )?;
+        let forced = match stopped.outcome {
+            StopOutcome::Graceful => false,
+            StopOutcome::Forced => true,
+            StopOutcome::TimedOut => {
+                return Err(Error::other(format!(
+                    "OpenVMM process {} of sandbox {} did not exit after it was terminated",
+                    vmm.record().process().pid,
+                    self.instance.name
+                )));
+            }
+        };
+        Ok(Stopped {
+            forced,
+            report: report::read(&self.instance.report_path()),
+        })
     }
 }
 
@@ -962,19 +832,7 @@ impl Execution {
 
 #[cfg(test)]
 mod tests {
-    use std::thread;
-
     use super::*;
-    use crate::host::test_support::released;
-
-    /// A process ID that fits every platform's type and that no process has.
-    const GONE_PID: u32 = 0x7fff_fff0;
-
-    fn instance() -> (tempfile::TempDir, Instance) {
-        let directory = tempfile::tempdir().unwrap();
-        let instance = Instance::new(directory.path(), "aci-edge-sandboxes:0123");
-        (directory, instance)
-    }
 
     #[test]
     fn readiness_failures_explain_images_without_workload_accounts() {
@@ -992,195 +850,90 @@ mod tests {
         }
     }
 
-    #[test]
-    fn runtime_files_round_trip_and_are_cleared() {
-        let (_directory, instance) = instance();
-        assert!(instance.launch().unwrap().is_none());
-        assert!(instance.runtime().unwrap().is_none());
-        let launch = LaunchRecord {
-            format: STATE_FORMAT,
-            endpoint: "endpoint".to_owned(),
-            process: None,
-        };
-        instance.write_launch(&launch).unwrap();
-        assert_eq!(instance.launch().unwrap(), Some(launch.clone()));
-        let identified = LaunchRecord {
-            process: Some(ProcessIdentity {
-                pid: 1,
-                start_time: 2,
-            }),
-            ..launch.clone()
-        };
-        instance.write_launch(&identified).unwrap();
-        assert_eq!(instance.launch().unwrap(), Some(identified));
-        instance.remove_launch();
-        assert!(instance.launch().unwrap().is_none());
-        instance.write_launch(&launch).unwrap();
-        let runtime = RuntimeRecord {
-            format: STATE_FORMAT,
-            pid: 1,
-            start_time: 2,
-            endpoint: "endpoint".to_owned(),
-        };
-        instance.write_runtime(&runtime).unwrap();
-        instance.write_capability(&[9; CAPABILITY_LEN]).unwrap();
-        assert_eq!(instance.runtime().unwrap(), Some(runtime));
-        assert_eq!(instance.read_capability().unwrap(), [9; CAPABILITY_LEN]);
-        drop(instance.create_log().unwrap());
-        instance.clear_runtime().unwrap();
-        assert!(instance.runtime().unwrap().is_none());
-        assert!(instance.launch().unwrap().is_none());
-        assert!(instance.read_capability().is_err());
-        // The log and the report outlive the run.
-        assert!(instance.log_path().is_file());
-    }
+    /// The instance's store, which exists on Linux and Windows hosts.
+    #[cfg(any(target_os = "linux", windows))]
+    mod store {
+        use serde_json::json;
 
-    #[test]
-    fn records_keep_their_json_form() {
-        let launch = LaunchRecord {
-            format: STATE_FORMAT,
-            endpoint: "/state/t/control.sock".to_owned(),
-            process: Some(ProcessIdentity {
-                pid: 7,
-                start_time: 8,
-            }),
-        };
-        assert_eq!(
-            serde_json::to_value(&launch).unwrap(),
-            serde_json::json!({
-                "format": 3,
-                "endpoint": "/state/t/control.sock",
-                "process": { "pid": 7, "startTime": 8 },
-            })
-        );
-        let runtime: RuntimeRecord = serde_json::from_value(serde_json::json!({
-            "format": 3, "pid": 7, "startTime": 8, "endpoint": "e",
-        }))
-        .unwrap();
-        assert_eq!(runtime.start_time, 8);
-        // A marker of an interrupted start that predates process identities has none.
-        let legacy: LaunchRecord =
-            serde_json::from_value(serde_json::json!({ "format": 3, "endpoint": "e" })).unwrap();
-        assert_eq!(legacy.process, None);
-    }
+        use super::super::*;
+        use crate::host::launch::PROCESS_COMMAND_LINE_LIMIT;
+        use crate::host::store::{ArtifactIdentity, JOURNAL_NAME, RUNTIME_NAME};
 
-    #[test]
-    fn records_of_other_formats_are_rejected() {
-        let (directory, instance) = instance();
-        let write = |name: &str, value: serde_json::Value| {
-            fs::write(directory.path().join(name), value.to_string()).unwrap();
-        };
-        write(
-            RUNTIME_NAME,
-            serde_json::json!({ "format": 2, "pid": 1, "startTime": 2, "endpoint": "e" }),
-        );
-        let error = instance.runtime().unwrap_err();
-        assert_eq!(error.kind(), ErrorKind::Io);
-        assert!(error.message().contains("unsupported format"), "{error}");
-        write(
-            LAUNCH_NAME,
-            serde_json::json!({ "format": 2, "endpoint": "e" }),
-        );
-        assert!(instance.launch().is_err());
-        fs::write(directory.path().join(RUNTIME_NAME), b"{ truncated").unwrap();
-        assert!(
-            instance
-                .runtime()
-                .unwrap_err()
-                .message()
-                .contains("malformed")
-        );
-        fs::write(directory.path().join(CAPABILITY_NAME), [0; CAPABILITY_LEN]).unwrap();
-        assert!(instance.read_capability().is_err());
-    }
+        fn instance() -> (tempfile::TempDir, Instance) {
+            let directory = tempfile::tempdir().unwrap();
+            let instance =
+                Instance::create(directory.path().join("vm"), "aci-edge-sandboxes:0123").unwrap();
+            (directory, instance)
+        }
 
-    #[test]
-    fn reconciliation_forgets_vms_that_are_gone() {
-        let (_directory, instance) = instance();
-        let runtime = RuntimeRecord {
-            format: STATE_FORMAT,
-            pid: GONE_PID,
-            start_time: 0,
-            endpoint: "endpoint".to_owned(),
-        };
-        instance.write_runtime(&runtime).unwrap();
-        instance.write_capability(&[1; CAPABILITY_LEN]).unwrap();
-        assert_eq!(instance.reconcile().unwrap(), None);
-        assert!(instance.runtime().unwrap().is_none());
-        assert!(instance.read_capability().is_err());
-        // The marker of an interrupted start whose process is gone is cleared too.
-        instance
-            .write_launch(&LaunchRecord {
-                format: STATE_FORMAT,
-                endpoint: "endpoint".to_owned(),
-                process: Some(ProcessIdentity {
-                    pid: GONE_PID,
-                    start_time: 0,
-                }),
-            })
-            .unwrap();
-        assert_eq!(instance.reconcile().unwrap(), None);
-        assert!(instance.launch().unwrap().is_none());
-    }
+        /// Returns the runtime identity of the launches of these tests.
+        fn runtime() -> RuntimeIdentity {
+            let artifact = |digit: &str| ArtifactIdentity::sha256(&digit.repeat(64)).unwrap();
+            RuntimeIdentity::new(artifact("1"), artifact("2"), artifact("3"))
+        }
 
-    #[test]
-    fn capabilities_are_never_all_zero() {
-        let first = generate_capability().unwrap();
-        assert_ne!(first, [0; CAPABILITY_LEN]);
-        assert_ne!(first, generate_capability().unwrap());
-    }
+        #[test]
+        fn instances_that_record_no_vm_need_no_runtime_identity() {
+            let (_directory, instance) = instance();
+            let mut locked = instance.lock(None).unwrap();
+            let found = locked
+                .find(|| panic!("an instance that records no VM needs no runtime identity"))
+                .unwrap();
+            assert!(matches!(found, Found::Stopped), "{found:?}");
+            drop(locked);
+            let reopened = Instance::open(instance.dir(), instance.name()).unwrap();
+            assert_eq!(reopened, instance);
+        }
 
-    #[test]
-    fn locks_are_exclusive() {
-        let directory = tempfile::tempdir().unwrap();
-        let path = directory.path().join("instance.lock");
-        let guard = lock(&path).unwrap();
-        let contender = OpenOptions::new().write(true).open(&path).unwrap();
-        assert!(contender.try_lock().is_err());
-        drop(guard);
-        assert!(released(|| match contender.try_lock() {
-            Ok(()) => true,
-            Err(std::fs::TryLockError::WouldBlock) => false,
-            Err(error) => panic!("{error}"),
-        }));
-        drop(contender);
-        // A waiter takes the lock once the holder releases it.
-        let guard = lock(&path).unwrap();
-        let waiter = thread::spawn({
-            let path = path.clone();
-            move || lock(&path).map(drop)
-        });
-        thread::sleep(Duration::from_millis(50));
-        drop(guard);
-        waiter.join().unwrap().unwrap();
-    }
+        #[test]
+        fn records_of_the_earlier_format_fail_naming_it() {
+            // Before the store, instances kept runtime records and launch markers of format 3.
+            for (name, record) in [
+                (
+                    RUNTIME_NAME,
+                    json!({ "format": 3, "pid": 7, "startTime": 8, "endpoint": "e" }),
+                ),
+                (
+                    JOURNAL_NAME,
+                    json!({ "format": 3, "endpoint": "e", "process": { "pid": 7, "startTime": 8 } }),
+                ),
+            ] {
+                let (_directory, instance) = instance();
+                let path = instance.dir().join(name);
+                fs::write(&path, record.to_string()).unwrap();
+                let mut locked = instance.lock(None).unwrap();
+                let error = locked.find(|| Ok(runtime())).unwrap_err();
+                assert_eq!(error.kind(), ErrorKind::Io);
+                assert!(
+                    error.message().contains("has the unsupported format 3"),
+                    "{error}"
+                );
+                assert!(
+                    error
+                        .message()
+                        .contains("stop the sandbox with the build that started it"),
+                    "{error}"
+                );
+                // Nothing is migrated or removed.
+                assert!(path.is_file());
+            }
+        }
 
-    #[test]
-    fn private_files_are_replaced_atomically() {
-        let directory = tempfile::tempdir().unwrap();
-        let path = directory.path().join("value.json");
-        write_json(&path, &serde_json::json!({ "a": 1 })).unwrap();
-        write_json(&path, &serde_json::json!({ "a": 2 })).unwrap();
-        assert_eq!(
-            read_json::<serde_json::Value>(&path).unwrap(),
-            Some(serde_json::json!({ "a": 2 }))
-        );
-        assert_eq!(fs::read_to_string(&path).unwrap(), "{\n  \"a\": 2\n}\n");
-        // Nothing but the file remains, and a missing file reads as absent.
-        assert_eq!(fs::read_dir(directory.path()).unwrap().count(), 1);
-        assert!(
-            read_json::<serde_json::Value>(&directory.path().join("missing"))
-                .unwrap()
-                .is_none()
-        );
-        remove_if_present(&path).unwrap();
-        remove_if_present(&path).unwrap();
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::PermissionsExt;
-            write_private(&path, b"secret").unwrap();
-            let mode = fs::metadata(&path).unwrap().permissions().mode();
-            assert_eq!(mode & 0o777, 0o600);
+        #[test]
+        fn launches_are_checked_before_the_instance_exists() {
+            let directory = tempfile::tempdir().unwrap();
+            let mut spec = LaunchSpec::new(
+                Artifacts::new("openvmm", "vmlinux", "initramfs.cpio.gz"),
+                crate::Hypervisor::Kvm,
+            );
+            let dir = directory.path().join("vm");
+            check_launch(&dir, &spec).unwrap();
+            spec.openvmm = directory
+                .path()
+                .join("o".repeat(PROCESS_COMMAND_LINE_LIMIT));
+            let error = check_launch(&dir, &spec).unwrap_err();
+            assert_eq!(error.kind(), ErrorKind::Unsupported, "{error}");
+            assert!(!dir.exists());
         }
     }
 }

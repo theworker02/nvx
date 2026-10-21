@@ -4,20 +4,32 @@ use std::fs;
 use std::path::Path;
 
 use aci_edge_sandboxes::SandboxId;
+use aci_edge_sandboxes::nvx::host::platform;
 
 /// Turns the state of a running sandbox into the state left by a caller that died between
-/// launching OpenVMM and recording its process identity. Returns the OpenVMM process ID.
+/// launching OpenVMM and recording its process identity: the launch journal of the VM's launch,
+/// without the identity, whose claimed log OpenVMM still holds as its standard output. Returns the
+/// OpenVMM process ID.
 pub(crate) fn interrupt_start(state_root: &Path, sandbox_id: &SandboxId) -> u32 {
     let dir = state_root.join(sandbox_id.token());
     let runtime: serde_json::Value =
         serde_json::from_slice(&fs::read(dir.join("runtime.json")).unwrap()).unwrap();
-    let marker = serde_json::json!({
+    let (device, index) = platform::file_identity(&dir.join("openvmm.log")).unwrap();
+    let journal = serde_json::json!({
         "format": runtime["format"],
+        "launch": runtime["launch"],
         "endpoint": runtime["endpoint"],
+        "runtime": runtime["runtime"],
+        "log": { "identity": { "device": device, "index": index } },
     });
-    fs::write(dir.join("launch.json"), marker.to_string()).unwrap();
+    fs::write(dir.join("launch.json"), journal.to_string()).unwrap();
     fs::remove_file(dir.join("runtime.json")).unwrap();
-    u32::try_from(runtime["pid"].as_u64().unwrap()).unwrap()
+    recorded_pid(&runtime)
+}
+
+/// Returns the OpenVMM process ID that a runtime record names.
+pub(crate) fn recorded_pid(runtime: &serde_json::Value) -> u32 {
+    u32::try_from(runtime["process"]["pid"].as_u64().unwrap()).unwrap()
 }
 
 /// Returns whether a process runs. Zombies have exited; only their parent has yet to reap them.

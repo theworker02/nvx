@@ -54,13 +54,13 @@ nvx-rs/
 | `nvx::contract` | The OpenVMM microVM ABI, broker protocol, and control-contract revision that the crate speaks, and `manifest_is_compatible` for a release's `SOURCE-MANIFEST.json` |
 | `nvx::net` | `Cidr`: IPv4 and IPv6 networks and their subtraction; `is_valid_hostname` and `is_valid_guest_network`, the forms of a VM's hostname and guest address |
 | `nvx::Hypervisor` | KVM, MSHV, or WHP, with its serde form behind the `serde` feature |
-| `nvx::host::artifacts` | `Artifacts` (also `nvx::Artifacts`): the OpenVMM executable, guest kernel, and Alpine initramfs, from a release, a repository checkout, the environment, a directory next to the executable, or the bundle. `ArtifactDir` and `Guest`: every artifact of the guests that `nvx.py` runs, the OpenVMM executable, the kernel, the Alpine, Ubuntu, and Azure Linux initramfs images and their package manifests, and the Ubuntu distro layer and its manifest, in a checkout's `build/` and `openvmm/target/release/` or a release's `guest/` and `bin/`, checked in the order and with the messages of `nvx.py`. `ArtifactPaths` lists them all and serializes as JSON. `ArtifactDir::runtime_identity` reads the `RuntimeIdentity` of the OpenVMM executable, kernel, and Alpine initramfs from the install metadata, a release's `SHA256SUMS` or a checkout's build provenance, without hashing an artifact |
+| `nvx::host::artifacts` | `Artifacts` (also `nvx::Artifacts`): the OpenVMM executable, guest kernel, and Alpine initramfs, from a release, a repository checkout, the environment, a directory next to the executable, or the bundle. Artifacts located in a release or checkout keep its `ArtifactDir`, and `Artifacts::runtime_identity` reads their `RuntimeIdentity` from its install metadata; artifacts named by path have none. `ArtifactDir` and `Guest`: every artifact of the guests that `nvx.py` runs, the OpenVMM executable, the kernel, the Alpine, Ubuntu, and Azure Linux initramfs images and their package manifests, and the Ubuntu distro layer and its manifest, in a checkout's `build/` and `openvmm/target/release/` or a release's `guest/` and `bin/`, checked in the order and with the messages of `nvx.py`. `ArtifactPaths` lists them all and serializes as JSON. `ArtifactDir::runtime_identity` reads the `RuntimeIdentity` of the OpenVMM executable, kernel, and Alpine initramfs from the install metadata, a release's `SHA256SUMS` or a checkout's build provenance, without hashing an artifact |
 | `nvx::host::launch` | `LaunchSpec` and OpenVMM's command line: the managed lifecycle, the `WorkloadIdentity`, the 1024-byte kernel command line, its reserved parameters, the 32,767-character limit of a Windows command line, and `LaunchSpec::check`, which every command line applies to the memory size, the non-root identity, the hostname, the guest network, and the kernel parameters |
 | `nvx::host::network` | `NetworkPolicy` and `openvmm_arguments`: the egress default and rules, ingress, host-loopback access and forwards as OpenVMM options. Egress rules are lowered exactly into OpenVMM's IPv4 and IPv6 rules by the lowering of egress policy files, with at most 256 rules for each action |
 | `nvx::host::network::policy` | Egress policy files: `compile_policy_file`, `compile_policy_bytes`, and `compile_policy` compile one to a `CompiledEgressPolicy` of native rules; see [Egress policy files](#egress-policy-files) |
 | `nvx::host::filesystem` | The `ExportPlan` of host paths through OpenVMM's aggregate virtio-fs device, the host-mapping table, the reserved guest targets, and `guest_path` and `resolve_guest_path` (also at `nvx::`) |
 | `nvx::host::store` | `SandboxStore`: the runtime records of one sandbox in a private directory with one lock, which every host that supervises the sandbox shares. The `RuntimeRecord` names the running VM: the `ProcessRef` of its VMM, its control endpoint, and the `RuntimeIdentity` that it was launched with, the identities of its OpenVMM, kernel, and initramfs from install or staging metadata and its boot and control contract versions, which decide whether another build of the host may reattach to it. The `LaunchJournal` of a launch holds a marker written before the spawn, the VMM's `ProcessRef` right after it, and an inherited claim on the VMM's log, which proves that a launch that never published its endpoint has exited, so that recovery ends an interrupted launch and signals only a VMM that it holds through a verified `Process`. Records are JSON in one versioned format, and records in any other format fail rather than being migrated |
-| `nvx::host::instance` | `Instance`: a VM in a directory of its own. It starts OpenVMM with a fresh capability and waits until the guest is ready and has mounted the mapped paths, reconciles recorded state, recovers interrupted launches, runs workloads and pumps their output, and stops the VM with a forced fallback |
+| `nvx::host::instance` | `Instance`: a VM in a sandbox store of its own, which `nvx::host::store`, `nvx::host::supervisor`, and `nvx::host::session` drive. Under the store's lock, `LockedInstance::find` reattaches to the VM, ends a start that was interrupted, and reports a VM of another runtime identity as `Mismatched` rather than driving it; `LockedInstance::start` launches OpenVMM through the supervisor with a fresh capability, under the caller's `RuntimeIdentity`, waits until the guest is ready and has mounted the mapped paths, and commits the launch; and `LockedInstance::stop` stops the VM with a forced fallback. `Instance::exec` runs workloads without the lock and pumps their output. `write_json` and `read_json` keep the configuration records that callers store beside an instance |
 | `nvx::host::nvxs` | `HostConnection`: the host's role of the NVXS session over a platform transport, on which `nvx::host::session` and other host applications run their protocols. It attaches with the launch capability, waiting while the broker asks it to, sends application bytes in as many DATA records as they take, and returns each DATA payload from the guest, with deadlines; a receive that times out keeps a partial record |
 | `nvx::host::process` | Verified process references, and the launch of OpenVMM for `nvx::host::instance`, through `nvx::host::supervisor`. A `ProcessRef` names one process by its ID, its start time, and the `BootId` of the host boot during which it started. `Process::open` checks a reference and holds its process through a pidfd on Linux or a process handle on Windows, whether or not the caller started it, so that waits sleep until the process exits and termination never reaches a process that reuses its ID. A reference from an earlier boot names an exited process, and a process whose identity this user cannot check, such as another user's, makes `Process::open` fail rather than report an exit. Linux hosts without pidfds poll the reference instead, and cannot terminate the process |
 | `nvx::host::supervisor` | The supervisor of a sandbox's VMM, beneath the CLI, `Instance`, and external orchestrators, which keep the configuration, the authorization, and the application protocol. `launch` runs the store's launch steps under the sandbox's lock: it writes the journal's marker, spawns OpenVMM with the claimed log, records its `ProcessRef` right after, and returns a `Starting` launch that the caller commits once the VMM serves its control endpoint, or abandons. A launch that fails never leaves an unrecorded VMM running. `VmmCommand::inherit` lists the descriptors (Linux) or handles (Windows) that the VMM inherits under their numbers, besides its standard streams, and it inherits nothing else of the caller's: on Linux, they must be close-on-exec, a flag that only the VMM's own process clears; on Windows, they join the VMM's explicit handle list. `Vmm::stop` runs one graceful step of the caller's and waits for the VMM's exit event until a deadline, and takes a bounded forced step through the VMM's verified identity only on request. `reattach` recovers an interrupted launch, and holds the recorded VMM again after the orchestrator restarts within the same host boot: `Live`, `Mismatched` with another runtime identity, `Exited`, or `Indeterminate` |
@@ -473,17 +473,25 @@ uses it that way.
 use std::sync::atomic::AtomicBool;
 use std::time::Duration;
 
-use nvx::host::instance::{self, Instance};
+use nvx::host::instance::{Found, Instance};
 use nvx::host::launch::LaunchSpec;
 use nvx::protocol::{Workload, WorkloadEnvironment};
 use nvx::{Artifacts, Hypervisor};
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
-    let spec = LaunchSpec::new(Artifacts::discover()?, Hypervisor::from_env_or_default()?);
-    let directory = std::env::temp_dir().join("nvx-example");
-    instance::create_private_dir(&directory)?;
-    let instance = Instance::new(&directory, "example");
-    let started = instance.start(&spec, Duration::from_secs(60))?;
+    let artifacts = Artifacts::discover()?;
+    let runtime = artifacts.runtime_identity()?;
+    let spec = LaunchSpec::new(artifacts, Hypervisor::from_env_or_default()?);
+    let instance = Instance::create(std::env::temp_dir().join("nvx-example"), "example")?;
+    // Lifecycle transitions hold the instance's lock; executions need none.
+    let mut locked = instance.lock(None)?;
+    let Found::Stopped = locked.find(|| Ok(runtime.clone()))? else {
+        return Err("the example's VM runs already".into());
+    };
+    locked.start(&spec, &runtime, Duration::from_secs(60))?;
+    let Found::Running(running) = locked.find(|| Ok(runtime.clone()))? else {
+        return Err("the example's VM stopped".into());
+    };
 
     let workload = Workload {
         argv: vec!["/bin/echo".to_owned(), "hello".to_owned()],
@@ -492,8 +500,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         environment: WorkloadEnvironment::Default,
     };
     let timeout = Duration::from_secs(60);
-    let capability = instance.read_capability()?;
-    let execution = instance.exec(&started.runtime, &capability, &workload, timeout, timeout)?;
+    let execution = instance.exec(&running, &workload, timeout, timeout)?;
     let mut stdout = Vec::new();
     let outcome = execution.pump(
         &mut |chunk: &[u8]| {
@@ -504,7 +511,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         &AtomicBool::new(false),
     )?;
     println!("{outcome:?}: {}", String::from_utf8_lossy(&stdout));
-    instance.stop(&started.runtime, Duration::from_secs(30))?;
+    locked.stop(running, Duration::from_secs(30))?;
     Ok(())
 }
 ```
@@ -524,8 +531,8 @@ as is, an `ErrorKind`, and an optional cause.
 | `TimedOut` | A deadline that passed |
 | `Other` | Any other failure |
 
-Messages call an instance `sandbox NAME`, after the name that `Instance::new`
-gives it. `aci_edge_sandboxes` maps the kinds onto its error codes; see its
+Messages call an instance `sandbox NAME`, after the name that `Instance::create`
+or `Instance::open` gives it. `aci_edge_sandboxes` maps the kinds onto its error codes; see its
 [error mapping](../aci_edge_sandboxes/README.md#error-mapping).
 
 ## Bundled artifacts

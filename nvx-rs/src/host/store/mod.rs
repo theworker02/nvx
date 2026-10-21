@@ -174,8 +174,8 @@ use crate::protocol::CAPABILITY_LEN;
 /// Version of the store's records.
 ///
 /// It follows the versions of the runtime state that the CLI kept on its own, 1, and that
-/// [`instance`](super::instance) keeps, up to 3, so that a record of theirs fails as unsupported
-/// rather than being read as one of the store's.
+/// [`instance`](super::instance) kept, up to 3, before both moved to the store, so that a record
+/// of theirs fails as unsupported rather than being read as one of the store's.
 pub const FORMAT: u32 = 4;
 /// Name of the sandbox's lock.
 pub const LOCK_NAME: &str = "sandbox.lock";

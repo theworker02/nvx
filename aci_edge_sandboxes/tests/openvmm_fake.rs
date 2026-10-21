@@ -6,16 +6,19 @@
     any(target_os = "linux", windows)
 ))]
 
+use std::ffi::OsString;
 use std::fs;
-use std::io::{Read, Write};
+use std::io::Read;
 use std::path::{Path, PathBuf};
-use std::process::{Child, Command, Stdio};
 use std::sync::mpsc;
 use std::thread;
-use std::time::{Duration, Instant, SystemTime};
+use std::time::{Duration, Instant};
 
 use aci_edge_sandboxes::nvx::Hypervisor;
 use aci_edge_sandboxes::nvx::host::platform;
+use aci_edge_sandboxes::nvx::host::store::{ArtifactIdentity, RuntimeIdentity, SandboxStore};
+use aci_edge_sandboxes::nvx::host::supervisor::{self, Launched, VmmCommand};
+use aci_edge_sandboxes::nvx::protocol::CAPABILITY_LEN;
 use aci_edge_sandboxes::openvmm::OpenVmmConfig;
 use aci_edge_sandboxes::{
     Access, AciEdgeSandbox, EgressPolicy, ErrorCode, ExecFailure, ExecOutcome, ExecOutput,
@@ -32,76 +35,35 @@ struct Fixture {
     state_root: PathBuf,
 }
 
-struct PendingVm {
-    child: Child,
-}
+/// The capability of the launches that tests begin themselves.
+const CAPABILITY: [u8; CAPABILITY_LEN] = [7; CAPABILITY_LEN];
 
-impl PendingVm {
-    fn spawn(arguments: &[String], capability: &[u8], directory: &Path) -> Self {
-        let (reader, mut writer) = std::io::pipe().unwrap();
-        writer.write_all(capability).unwrap();
-        drop(writer);
-        Self {
-            child: Command::new(env!("CARGO_BIN_EXE_aci-edge-sandboxes-fake-openvmm"))
-                .args(arguments)
-                .current_dir(directory)
-                .stdin(Stdio::from(reader))
-                .stdout(Stdio::null())
-                .stderr(Stdio::null())
-                .spawn()
-                .unwrap(),
-        }
-    }
+/// The OpenVMM process of a start that a test interrupted, which is killed when the test ends if
+/// it still runs.
+struct Orphan(Option<Launched>);
 
-    #[cfg(target_os = "linux")]
-    fn start_time(&self) -> u64 {
-        let stat = fs::read_to_string(format!("/proc/{}/stat", self.child.id())).unwrap();
-        stat.rsplit_once(')')
-            .unwrap()
-            .1
-            .split_whitespace()
-            .nth(19)
-            .unwrap()
-            .parse()
-            .unwrap()
-    }
-
-    #[cfg(windows)]
-    fn start_time(&self) -> u64 {
-        use std::os::windows::io::AsRawHandle;
-
-        use windows_sys::Win32::Foundation::FILETIME;
-        use windows_sys::Win32::System::Threading::GetProcessTimes;
-
-        let mut created = FILETIME {
-            dwLowDateTime: 0,
-            dwHighDateTime: 0,
-        };
-        let mut exited = created;
-        let mut kernel = created;
-        let mut user = created;
-        // SAFETY: Child owns the live process handle and all outputs point to valid storage.
-        let succeeded = unsafe {
-            GetProcessTimes(
-                self.child.as_raw_handle().cast(),
-                &mut created,
-                &mut exited,
-                &mut kernel,
-                &mut user,
-            )
-        };
-        assert_ne!(succeeded, 0, "{}", std::io::Error::last_os_error());
-        (u64::from(created.dwHighDateTime) << 32) | u64::from(created.dwLowDateTime)
+impl Orphan {
+    /// Returns the process.
+    fn launched(&self) -> &Launched {
+        self.0
+            .as_ref()
+            .expect("the process is held until the test ends")
     }
 }
 
-impl Drop for PendingVm {
+impl Drop for Orphan {
     fn drop(&mut self) {
-        if self.child.try_wait().unwrap().is_none() {
-            self.child.kill().unwrap();
+        if let Some(launched) = self.0.take() {
+            launched.kill_and_wait();
         }
-        self.child.wait().unwrap();
     }
+}
+
+/// Returns the runtime identity of the fake artifacts, whose OpenVMM identity is the digit
+/// `openvmm` repeated.
+fn runtime_with(openvmm: char) -> RuntimeIdentity {
+    let artifact = |digit: char| ArtifactIdentity::sha256(&digit.to_string().repeat(64)).unwrap();
+    RuntimeIdentity::new(artifact(openvmm), artifact('2'), artifact('3'))
 }
 
 impl Fixture {
@@ -124,6 +86,7 @@ impl Fixture {
             Hypervisor::platform_default().expect("tests run on Linux or Windows"),
             &self.state_root,
         );
+        config.runtime_identity = Some(runtime_with('1'));
         config.skip_hypervisor_probe = true;
         config.start_timeout = Duration::from_secs(30);
         config.control_timeout = Duration::from_secs(15);
@@ -172,9 +135,18 @@ impl Fixture {
             .count()
     }
 
+    /// Returns the number of sandbox directories that hold a lock file.
     fn lock_files(&self) -> usize {
-        fs::read_dir(self.state_root.join(".locks"))
+        fs::read_dir(&self.state_root)
             .unwrap()
+            .filter(|entry| {
+                entry
+                    .as_ref()
+                    .unwrap()
+                    .path()
+                    .join("sandbox.lock")
+                    .is_file()
+            })
             .count()
     }
 }
@@ -985,8 +957,8 @@ fn crashed_vms_fall_back_to_provisioned() {
     // Wait until the VM is gone, as the backend tells it: an exec that the crash interrupts fails
     // as a broken control session instead, with `BackendError`.
     let runtime = state_json(&fixture, &sandbox_id, "runtime.json");
-    let pid = u32::try_from(runtime["pid"].as_u64().unwrap()).unwrap();
-    let start_time = runtime["startTime"].as_u64().unwrap();
+    let pid = support::recorded_pid(&runtime);
+    let start_time = runtime["process"]["startTime"].as_u64().unwrap();
     let deadline = Instant::now() + Duration::from_secs(30);
     while platform::process_start_time(pid).unwrap() == Some(start_time) {
         assert!(Instant::now() < deadline, "the crash was never observed");
@@ -1146,7 +1118,7 @@ fn interrupted_starts_do_not_leak_vms() {
     let dir = fixture.state_root.join(sandbox_id.token());
     assert!(!dir.join("launch.json").exists());
     let restarted = state_json(&fixture, &sandbox_id, "runtime.json");
-    assert_ne!(restarted["pid"], runtime["pid"]);
+    assert_ne!(restarted["process"], runtime["process"]);
     assert_eq!(
         run(&nvx, &sandbox_id, "echo recovered").stdout,
         b"recovered\n"
@@ -1161,39 +1133,46 @@ fn interrupted_starts_before_an_endpoint_recover_or_retain_the_child() {
         let fixture = Fixture::new();
         let nvx = fixture.nvx();
         let sandbox_id = nvx.provision(&ProvisionRequest::new()).unwrap().sandbox_id;
+        // OpenVMM's arguments, as a start of the sandbox recorded them.
         nvx.start(&sandbox_id).unwrap();
-        let runtime = state_json(&fixture, &sandbox_id, "runtime.json");
-        let dir = fixture.state_root.join(sandbox_id.token());
-        let capability = fs::read(dir.join("control.capability")).unwrap();
         let mut arguments = fixture.launch_arguments(&sandbox_id);
+        nvx.stop(&sandbox_id).unwrap();
         let command_line = arguments
             .iter()
             .position(|argument| argument == "--cmdline")
             .unwrap()
             + 1;
         arguments[command_line].push_str(" fake_boot_delay_ms=30000");
-        nvx.stop(&sandbox_id).unwrap();
-        fs::remove_file(dir.join("outcome.json")).unwrap();
 
-        let child = PendingVm::spawn(&arguments, &capability, &dir);
-        let pid = child.child.id();
-        let mut launch = serde_json::json!({
-            "format": runtime["format"],
-            "endpoint": runtime["endpoint"],
-        });
-        if identified {
-            launch["process"] = serde_json::json!({ "pid": pid, "startTime": child.start_time() });
-        }
-        let marker = dir.join("launch.json");
-        fs::write(&marker, launch.to_string()).unwrap();
-        fs::File::options()
-            .write(true)
-            .open(&marker)
-            .unwrap()
-            .set_modified(SystemTime::now() - Duration::from_secs(120))
+        // A caller begins a start in the sandbox's store, spawns OpenVMM, which serves no
+        // endpoint for a while, records its process identity or not, and dies.
+        let dir = fixture.state_root.join(sandbox_id.token());
+        let store = SandboxStore::open(&dir).unwrap();
+        let mut locked = store.lock(None).unwrap();
+        let mut launch = locked
+            .begin_launch(&runtime_with('1'), &CAPABILITY)
             .unwrap();
+        let listen = arguments
+            .iter()
+            .position(|argument| argument.starts_with("listen="))
+            .unwrap();
+        arguments[listen] = format!("listen={}", launch.endpoint());
+        let command = VmmCommand::new(
+            env!("CARGO_BIN_EXE_aci-edge-sandboxes-fake-openvmm"),
+            arguments.iter().map(OsString::from).collect(),
+            &dir,
+        );
+        let log = launch.take_log().unwrap();
+        let child = Orphan(Some(supervisor::spawn(&command, &CAPABILITY, log).unwrap()));
+        if identified {
+            launch.record_process(child.launched()).unwrap();
+        }
+        drop(launch);
+        drop(locked);
+        let pid = child.launched().id();
+        let journal = dir.join("launch.json");
         assert!(support::process_running(pid));
-        assert!(!dir.join("runtime.json").exists());
+        assert!(journal.exists());
 
         let result = nvx.start(&sandbox_id);
         if identified {
@@ -1202,9 +1181,9 @@ fn interrupted_starts_before_an_endpoint_recover_or_retain_the_child() {
                 !support::process_running(pid),
                 "the pre-endpoint child survived recovery"
             );
-            assert!(!marker.exists());
+            assert!(!journal.exists());
             assert_ne!(
-                state_json(&fixture, &sandbox_id, "runtime.json")["pid"],
+                support::recorded_pid(&state_json(&fixture, &sandbox_id, "runtime.json")),
                 pid
             );
             assert_eq!(
@@ -1217,9 +1196,16 @@ fn interrupted_starts_before_an_endpoint_recover_or_retain_the_child() {
             if result.is_ok() {
                 nvx.stop(&sandbox_id).unwrap();
             }
-            assert_eq!(result.unwrap_err().code(), ErrorCode::BackendError);
+            // OpenVMM holds the launch's log, and serves no endpoint that would name it, so
+            // nothing verifies it, and it is neither signaled nor forgotten.
+            let error = result.unwrap_err();
+            assert_eq!(error.code(), ErrorCode::BackendError, "{error}");
+            assert!(
+                error.message().contains("cannot determine whether"),
+                "{error}"
+            );
             assert!(support::process_running(pid));
-            assert!(marker.exists());
+            assert!(journal.exists());
             assert!(!dir.join("runtime.json").exists());
             assert_eq!(
                 nvx.deprovision(&sandbox_id).unwrap_err().code(),
@@ -1230,46 +1216,39 @@ fn interrupted_starts_before_an_endpoint_recover_or_retain_the_child() {
 }
 
 #[test]
-fn launch_markers_without_process_identity_do_not_expire() {
+fn unrecorded_launches_end_once_their_log_is_released() {
     let fixture = Fixture::new();
     let nvx = fixture.nvx();
     let sandbox_id = nvx.provision(&ProvisionRequest::new()).unwrap().sandbox_id;
+    // A caller begins a start and dies before it records OpenVMM, which would hold the launch's
+    // log, as this test does.
     let dir = fixture.state_root.join(sandbox_id.token());
-    let endpoint = if cfg!(windows) {
-        format!("//./pipe/openvmm-microvm-{}", sandbox_id.token())
-    } else {
-        dir.join("control.sock").to_string_lossy().into_owned()
-    };
-    let marker = dir.join("launch.json");
-    let format = state_json(&fixture, &sandbox_id, "sandbox.json")["format"].clone();
-    let launch = serde_json::json!({ "format": format, "endpoint": endpoint });
-    fs::write(&marker, launch.to_string()).unwrap();
+    let store = SandboxStore::open(&dir).unwrap();
+    let mut locked = store.lock(None).unwrap();
+    let mut launch = locked
+        .begin_launch(&runtime_with('1'), &CAPABILITY)
+        .unwrap();
+    let log = launch.take_log().unwrap();
+    drop(launch);
+    drop(locked);
+    let journal = dir.join("launch.json");
 
-    // An absent endpoint does not prove that the interrupted launch has no surviving child.
+    // While the log is held, nothing proves that the launch ended.
     for error in [
         nvx.start(&sandbox_id).unwrap_err(),
         nvx.deprovision(&sandbox_id).unwrap_err(),
     ] {
-        assert_eq!(error.code(), ErrorCode::BackendError);
+        assert_eq!(error.code(), ErrorCode::BackendError, "{error}");
     }
-    assert!(marker.exists());
+    assert!(journal.exists());
 
-    fs::File::options()
-        .write(true)
-        .open(&marker)
-        .unwrap()
-        .set_modified(SystemTime::now() - Duration::from_secs(120))
-        .unwrap();
-    let result = nvx.start(&sandbox_id);
-    if result.is_ok() {
-        nvx.stop(&sandbox_id).unwrap();
-    }
-    assert_eq!(result.unwrap_err().code(), ErrorCode::BackendError);
-    assert!(marker.exists());
-    assert_eq!(
-        nvx.deprovision(&sandbox_id).unwrap_err().code(),
-        ErrorCode::BackendError
-    );
+    // Its release proves it.
+    drop(log);
+    nvx.start(&sandbox_id).unwrap();
+    assert!(!journal.exists());
+    assert_eq!(run(&nvx, &sandbox_id, "echo started").stdout, b"started\n");
+    nvx.stop(&sandbox_id).unwrap();
+    nvx.deprovision(&sandbox_id).unwrap();
 }
 
 #[test]
@@ -1993,6 +1972,136 @@ fn sandboxes_of_the_previous_state_format_are_refused() {
     let error = nvx.start(&sandbox_id).unwrap_err();
     assert_eq!(error.code(), ErrorCode::BackendError, "{error}");
     assert!(error.message().contains("unsupported format"), "{error}");
+}
+
+#[test]
+fn runtime_records_of_the_previous_format_are_refused() {
+    let fixture = Fixture::new();
+    let nvx = fixture.nvx();
+    let sandbox_id = nvx.provision(&ProvisionRequest::new()).unwrap().sandbox_id;
+    // Before NVX's sandbox store, the runtime record of a running VM had format 3. Nothing reads
+    // or migrates it: the VM must be stopped with the build that started it.
+    let record = fixture
+        .state_root
+        .join(sandbox_id.token())
+        .join("runtime.json");
+    let earlier = serde_json::json!({
+        "format": 3, "pid": 4242, "startTime": 1, "endpoint": "endpoint",
+    });
+    fs::write(&record, earlier.to_string()).unwrap();
+    for error in [
+        nvx.start(&sandbox_id).unwrap_err(),
+        nvx.exec(&sandbox_id, &ExecRequest::command_line("echo"))
+            .unwrap_err(),
+        nvx.stop(&sandbox_id).unwrap_err(),
+        nvx.deprovision(&sandbox_id).unwrap_err(),
+    ] {
+        assert_eq!(error.code(), ErrorCode::BackendError, "{error}");
+        assert!(
+            error.message().contains("has the unsupported format 3"),
+            "{error}"
+        );
+    }
+    assert!(record.is_file());
+}
+
+/// Writes the checksum list of `release`, in which `openvmm` is the digit of the OpenVMM
+/// executable's digest.
+fn write_checksums(release: &Path, openvmm: char) {
+    let executable = if cfg!(windows) {
+        "openvmm.exe"
+    } else {
+        "openvmm"
+    };
+    let text = format!(
+        "{}  bin/{executable}\n{}  guest/vmlinux\n{}  guest/initramfs.cpio.gz\n",
+        openvmm.to_string().repeat(64),
+        "2".repeat(64),
+        "3".repeat(64),
+    );
+    fs::write(release.join("SHA256SUMS"), text).unwrap();
+}
+
+#[test]
+fn runtime_identities_come_from_the_install_metadata() {
+    use aci_edge_sandboxes::nvx::contract;
+
+    let fixture = Fixture::new();
+    // A release that holds the fake OpenVMM and guest artifacts.
+    let release = fixture.directory.path().join("release");
+    let executable = if cfg!(windows) {
+        "openvmm.exe"
+    } else {
+        "openvmm"
+    };
+    fs::create_dir_all(release.join("bin")).unwrap();
+    fs::create_dir_all(release.join("guest")).unwrap();
+    fs::copy(
+        env!("CARGO_BIN_EXE_aci-edge-sandboxes-fake-openvmm"),
+        release.join("bin").join(executable),
+    )
+    .unwrap();
+    fs::write(release.join("guest").join("vmlinux"), b"kernel").unwrap();
+    fs::write(release.join("guest").join("initramfs.cpio.gz"), b"initrd").unwrap();
+    let manifest = serde_json::json!({ "openvmm": {
+        "microvm_abi_version": contract::MICROVM_ABI_VERSION,
+        "control_session_protocol_version": contract::CONTROL_SESSION_PROTOCOL_VERSION,
+        "control_contract_revision": contract::CONTROL_CONTRACT_REVISION,
+    }});
+    fs::write(release.join("SOURCE-MANIFEST.json"), manifest.to_string()).unwrap();
+    write_checksums(&release, '1');
+    let mut config = OpenVmmConfig::from_release_dir(
+        &release,
+        Hypervisor::platform_default().expect("tests run on Linux or Windows"),
+        &fixture.state_root,
+    )
+    .unwrap();
+    assert_eq!(config.runtime_identity, None);
+    config.skip_hypervisor_probe = true;
+    config.stop_timeout = Duration::from_secs(15);
+    let nvx = AciEdgeSandbox::openvmm(config).unwrap();
+    let sandbox_id = nvx.provision(&ProvisionRequest::new()).unwrap().sandbox_id;
+    nvx.start(&sandbox_id).unwrap();
+    // The store records the identity that the release's checksum list names.
+    let recorded = state_json(&fixture, &sandbox_id, "runtime.json")["runtime"].clone();
+    assert_eq!(
+        recorded["openvmm"],
+        format!("sha256:{}", "1".repeat(64)).as_str()
+    );
+    assert_eq!(run(&nvx, &sandbox_id, "echo before").stdout, b"before\n");
+
+    // The release is upgraded in place: the backend reads the new identity, and reports the VM
+    // that the earlier OpenVMM started rather than driving or stopping it.
+    write_checksums(&release, '4');
+    for error in [
+        nvx.exec(&sandbox_id, &ExecRequest::command_line("echo"))
+            .unwrap_err(),
+        nvx.stop(&sandbox_id).unwrap_err(),
+        nvx.start(&sandbox_id).unwrap_err(),
+        nvx.deprovision(&sandbox_id).unwrap_err(),
+    ] {
+        assert_eq!(error.code(), ErrorCode::BackendError, "{error}");
+        assert!(
+            error
+                .message()
+                .contains("runs under another runtime identity, which differs in OpenVMM"),
+            "{error}"
+        );
+    }
+    let pid = support::recorded_pid(&state_json(&fixture, &sandbox_id, "runtime.json"));
+    assert!(support::process_running(pid));
+
+    // Back on the artifacts that started it, the backend drives the VM again.
+    write_checksums(&release, '1');
+    assert_eq!(run(&nvx, &sandbox_id, "echo after").stdout, b"after\n");
+    nvx.stop(&sandbox_id).unwrap();
+    nvx.deprovision(&sandbox_id).unwrap();
+
+    // A release without its checksum list cannot be identified.
+    fs::remove_file(release.join("SHA256SUMS")).unwrap();
+    let error = nvx.probe().unwrap_err();
+    assert_eq!(error.code(), ErrorCode::BackendUnavailable, "{error}");
+    assert!(error.message().contains("SHA256SUMS"), "{error}");
 }
 
 #[test]

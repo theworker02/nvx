@@ -15,7 +15,7 @@
 //! - [`Hypervisor`]: the hypervisors that run the VMs.
 //! - [`host`] (feature `host`): artifact discovery, the OpenVMM command line, the lowering of
 //!   network and filesystem policies, the host's NVXS connection, control sessions, process and
-//!   platform primitives, the supervision of VM instances: starting, reconciling, executing
+//!   platform primitives, the supervision of VM instances: starting, reattaching, executing
 //!   workloads, and stopping, and the store of a sandbox's runtime records and launch journal.
 //! - `testing` (feature `testing`): a fake OpenVMM that serves the control console without
 //!   running a VM.
@@ -34,17 +34,26 @@
 //! use std::sync::atomic::AtomicBool;
 //! use std::time::Duration;
 //!
-//! use nvx::host::instance::{self, Instance};
+//! use nvx::host::instance::{Found, Instance};
 //! use nvx::host::launch::LaunchSpec;
 //! use nvx::protocol::{Workload, WorkloadEnvironment};
 //! use nvx::{Artifacts, Hypervisor};
 //!
-//! // Locates OpenVMM, the guest kernel, and the Alpine initramfs.
-//! let spec = LaunchSpec::new(Artifacts::discover()?, Hypervisor::from_env_or_default()?);
-//! let directory = std::env::temp_dir().join("nvx-example");
-//! instance::create_private_dir(&directory)?;
-//! let instance = Instance::new(&directory, "example");
-//! let started = instance.start(&spec, Duration::from_secs(60))?;
+//! // Locates OpenVMM, the guest kernel, and the Alpine initramfs, which the install metadata of
+//! // their release or checkout identifies.
+//! let artifacts = Artifacts::discover()?;
+//! let runtime = artifacts.runtime_identity()?;
+//! let spec = LaunchSpec::new(artifacts, Hypervisor::from_env_or_default()?);
+//! let instance = Instance::create(std::env::temp_dir().join("nvx-example"), "example")?;
+//! // Lifecycle transitions hold the instance's lock; executions need none.
+//! let mut locked = instance.lock(None)?;
+//! let Found::Stopped = locked.find(|| Ok(runtime.clone()))? else {
+//!     return Err("the example's VM runs already".into());
+//! };
+//! locked.start(&spec, &runtime, Duration::from_secs(60))?;
+//! let Found::Running(running) = locked.find(|| Ok(runtime.clone()))? else {
+//!     return Err("the example's VM stopped".into());
+//! };
 //!
 //! let workload = Workload {
 //!     argv: vec!["/bin/echo".to_owned(), "hello".to_owned()],
@@ -52,9 +61,8 @@
 //!     cwd: None,
 //!     environment: WorkloadEnvironment::Default,
 //! };
-//! let capability = instance.read_capability()?;
 //! let timeout = Duration::from_secs(60);
-//! let execution = instance.exec(&started.runtime, &capability, &workload, timeout, timeout)?;
+//! let execution = instance.exec(&running, &workload, timeout, timeout)?;
 //! let mut stdout = Vec::new();
 //! let outcome = execution.pump(
 //!     &mut |chunk: &[u8]| {
@@ -66,7 +74,7 @@
 //! )?;
 //! println!("{outcome:?}: {}", String::from_utf8_lossy(&stdout));
 //!
-//! instance.stop(&started.runtime, Duration::from_secs(30))?;
+//! locked.stop(running, Duration::from_secs(30))?;
 //! # Ok(())
 //! # }
 //! # #[cfg(not(feature = "host"))]

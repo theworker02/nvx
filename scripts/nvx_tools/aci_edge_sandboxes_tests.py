@@ -46,16 +46,12 @@ def configure_parser(parser: argparse.ArgumentParser) -> None:
 
 
 def e2e_environment(backend: str, state_root: Path, output_dir: Path) -> dict[str, str]:
+    # The test locates the artifacts in the checkout, whose build provenance identifies them.
+    require_file(openvmm_binary_path(), "OpenVMM release binary")
+    require_file(artifact_path(KernelBuildConstants.BINARY_NAME), "Linux direct kernel")
+    require_file(artifact_path(AlpineBuildConstants.INITRAMFS_NAME), "Alpine initramfs")
     paths = {
-        "ACI_EDGE_SANDBOXES_E2E_OPENVMM": require_file(
-            openvmm_binary_path(), "OpenVMM release binary"
-        ),
-        "ACI_EDGE_SANDBOXES_E2E_KERNEL": require_file(
-            artifact_path(KernelBuildConstants.BINARY_NAME), "Linux direct kernel"
-        ),
-        "ACI_EDGE_SANDBOXES_E2E_INITRD": require_file(
-            artifact_path(AlpineBuildConstants.INITRAMFS_NAME), "Alpine initramfs"
-        ),
+        "ACI_EDGE_SANDBOXES_E2E_ARTIFACTS_DIR": BuildConstants.REPO_ROOT,
         "ACI_EDGE_SANDBOXES_E2E_STATE_ROOT": state_root,
         "ACI_EDGE_SANDBOXES_E2E_OUTPUT_DIR": output_dir,
     }
@@ -91,13 +87,13 @@ def remaining_sandboxes(state_root: Path) -> list[Path]:
 
 
 def recorded_pid(sandbox: Path) -> int | None:
-    """Returns the OpenVMM process ID in a sandbox's runtime or launch record."""
-    for name, keys in (("runtime.json", ("pid",)), ("launch.json", ("process", "pid"))):
+    """Returns the OpenVMM process ID in a sandbox's runtime record or launch journal."""
+    for name in ("runtime.json", "launch.json"):
         try:
             value: object = json.loads((sandbox / name).read_text(encoding="utf-8"))
         except (OSError, ValueError):
             continue
-        for key in keys:
+        for key in ("process", "pid"):
             if not isinstance(value, dict):
                 value = None
                 break

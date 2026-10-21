@@ -2,39 +2,46 @@
 //!
 //! ```text
 //! <state_root>/
-//!   .locks/<token>.lock       serializes lifecycle transitions of one sandbox
 //!   <token>/
 //!     sandbox.json            provisioned configuration
-//!     launch.json             endpoint and available process identity of a start in progress
-//!     runtime.json            OpenVMM process identity and endpoint (running only)
+//!     sandbox.lock            serializes lifecycle transitions of the sandbox
+//!     launch.json             the journal of a start in progress, or of one that was interrupted
+//!     runtime.json            the runtime record of the running VM
 //!     control.capability      launch capability (running only)
 //!     control.sock            Linux control endpoint (running only)
 //!     openvmm.log             OpenVMM output of the latest start
 //!     outcome.json            OpenVMM outcome report of the latest run
 //! ```
 //!
-//! Each sandbox's directory is the directory of its VM [`Instance`], which keeps every file but
-//! `sandbox.json`.
+//! Each sandbox's directory is the store of its VM [`Instance`], which keeps every file but
+//! `sandbox.json`, the configuration that this crate records in a format of its own,
+//! [`STATE_FORMAT`].
 
 use std::fs;
 use std::io;
 use std::path::{Path, PathBuf};
 
 use nvx::host::filesystem::ExportPlan;
-use nvx::host::instance::{self, Instance, LockGuard};
+use nvx::host::instance::{self, Instance, LockedInstance};
+use nvx::host::platform;
+use nvx::host::store::{FILE_NAMES, LOCK_NAME, LOG_NAME};
 use serde::{Deserialize, Serialize};
 
 use crate::error::{Error, ErrorCode, Result};
 use crate::id::SandboxId;
 use crate::model::{HostLoopbackForward, NetworkPolicy};
 
-/// Version of the state files written by this crate, which records the instance's export plan.
-pub(crate) const STATE_FORMAT: u32 = instance::STATE_FORMAT;
+/// Version of `sandbox.json`, the configuration that this crate records, which holds the
+/// sandbox's [`ExportPlan`] in the form of `nvx`.
+///
+/// Version 1 described sandboxes assembled from image layers and a scratch disk, and version 2
+/// exported the mapped host paths as one directory whose bind mounts the kernel command line
+/// listed.
+pub(crate) const STATE_FORMAT: u32 = 3;
 /// Backend key recorded in every sandbox.
 pub(crate) const BACKEND_KEY: &str = "openvmm";
 
 const RECORD_NAME: &str = "sandbox.json";
-const LOCKS_NAME: &str = ".locks";
 
 /// Provisioned configuration of one sandbox.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -74,14 +81,32 @@ fn not_provisioned(sandbox_id: &SandboxId) -> Error {
     Error::stale_id(format!("sandbox {sandbox_id} is not provisioned"))
 }
 
+/// Removes the directory `dir` of a sandbox whose configuration is gone, and returns whether it
+/// is gone.
+///
+/// The directory stays while it is not empty: a transition that waited for the sandbox's lock may
+/// hold a lock file in it, and a file system without POSIX deletion keeps a removed lock file
+/// there until its last handle closes. Each such transition finds no configuration, and removes
+/// its lock file and the directory as it releases the lock.
+fn remove_emptied(dir: &Path) -> Result<bool> {
+    match fs::remove_dir(dir) {
+        Ok(()) => Ok(true),
+        Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(true),
+        Err(error) if error.kind() == io::ErrorKind::DirectoryNotEmpty => Ok(false),
+        Err(error) => Err(io_error(format!(
+            "cannot remove sandbox state {}",
+            dir.display()
+        ))(error)),
+    }
+}
+
 impl StateStore {
     /// Opens `root`, creating it and restricting it to the current user if needed.
     pub(crate) fn open(root: &Path) -> io::Result<Self> {
         if let Some(parent) = root.parent() {
             fs::create_dir_all(parent)?;
         }
-        instance::create_private_dir(root)?;
-        instance::create_private_dir(&root.join(LOCKS_NAME))?;
+        platform::create_private_dir(root)?;
         Ok(Self {
             root: root.to_path_buf(),
         })
@@ -91,64 +116,64 @@ impl StateStore {
         self.root.join(sandbox_id.token())
     }
 
-    /// Returns the VM instance of a sandbox, which messages call by the sandbox's ID.
-    pub(crate) fn instance(&self, sandbox_id: &SandboxId) -> Instance {
-        Instance::new(self.dir(sandbox_id), sandbox_id.to_string())
+    /// Returns the path of the OpenVMM log of a sandbox's latest start.
+    pub(crate) fn log_path(&self, sandbox_id: &SandboxId) -> PathBuf {
+        self.dir(sandbox_id).join(LOG_NAME)
     }
 
-    fn lock_path(&self, sandbox_id: &SandboxId) -> PathBuf {
-        self.root
-            .join(LOCKS_NAME)
-            .join(format!("{}.lock", sandbox_id.token()))
-    }
-
-    /// Takes the exclusive lifecycle lock of a sandbox and loads its configuration.
+    /// Takes the exclusive lifecycle lock of a sandbox, the lock of its instance's store, and
+    /// loads its configuration.
     ///
-    /// An ID without state fails with [`ErrorCode::StaleId`] and leaves no lock file behind, also
-    /// when its state disappears while this call waits for the lock, as it does when a
-    /// concurrent deprovision removes it. A stale ID never becomes valid again, so no other call
-    /// can still need the removed lock file.
+    /// An ID without configuration fails with [`ErrorCode::StaleId`], also when its state
+    /// disappears while this call waits for the lock, as it does when a concurrent deprovision
+    /// removes it. A stale ID never becomes valid again, so the call removes the lock file that
+    /// it may have created, and the sandbox's directory, such as one that an interrupted removal
+    /// left, if that empties it: a stale ID leaves nothing behind.
     pub(crate) fn lock_and_load(
         &self,
         sandbox_id: &SandboxId,
-    ) -> Result<(LockGuard, SandboxRecord)> {
-        if matches!(self.dir(sandbox_id).try_exists(), Ok(false)) {
-            return Err(not_provisioned(sandbox_id));
-        }
-        let guard = instance::lock(&self.lock_path(sandbox_id))?;
+    ) -> Result<(LockedInstance, SandboxRecord)> {
+        let dir = self.dir(sandbox_id);
+        let locked = match Instance::open(&dir, sandbox_id.to_string())
+            .and_then(|instance| instance.lock(None))
+        {
+            Ok(locked) => locked,
+            // The directory or its lock file went away, or never existed, with the sandbox.
+            Err(_) if matches!(dir.join(RECORD_NAME).try_exists(), Ok(false)) => {
+                let _ = remove_emptied(&dir);
+                return Err(not_provisioned(sandbox_id));
+            }
+            Err(error) => return Err(error.into()),
+        };
         match self.load(sandbox_id) {
-            Ok(record) => Ok((guard, record)),
+            Ok(record) => Ok((locked, record)),
             Err(error) if error.code() == ErrorCode::StaleId => {
-                drop(guard);
-                self.remove_lock(sandbox_id);
+                let _ = fs::remove_file(dir.join(LOCK_NAME));
+                drop(locked);
+                let _ = remove_emptied(&dir);
                 Err(error)
             }
             Err(error) => Err(error),
         }
     }
 
-    /// Removes the lock file of a deprovisioned sandbox.
-    pub(crate) fn remove_lock(&self, sandbox_id: &SandboxId) {
-        let _ = fs::remove_file(self.lock_path(sandbox_id));
-    }
-
-    /// Creates the state directory of a new sandbox.
+    /// Creates the state directory of a new sandbox, the store of its instance, private to the
+    /// current user, and records its configuration.
     pub(crate) fn create(&self, sandbox_id: &SandboxId, record: &SandboxRecord) -> Result<()> {
         let dir = self.dir(sandbox_id);
-        fs::create_dir(&dir).map_err(io_error(format!(
-            "cannot create sandbox state {}",
-            dir.display()
-        )))?;
-        let created = instance::create_private_dir(&dir)
-            .map_err(io_error(format!(
-                "cannot restrict sandbox state {}",
+        // Sandbox IDs are random, so the directory of a new one never exists.
+        if !matches!(dir.try_exists(), Ok(false)) {
+            return Err(Error::backend_error(format!(
+                "cannot create sandbox state {}: it exists already",
                 dir.display()
-            )))
-            .and_then(|()| Ok(instance::write_json(&dir.join(RECORD_NAME), record)?));
+            )));
+        }
+        let created = Instance::create(&dir, sandbox_id.to_string())
+            .and_then(|_| instance::write_json(&dir.join(RECORD_NAME), record));
         if created.is_err() {
             let _ = fs::remove_dir_all(&dir);
         }
-        created
+        Ok(created?)
     }
 
     /// Loads the configuration of a provisioned sandbox.
@@ -173,11 +198,13 @@ impl StateStore {
         })
     }
 
-    /// Deletes the state of a stopped sandbox.
+    /// Deletes the state of a stopped sandbox, whose lock `locked` holds, and releases the lock.
     ///
-    /// Unknown files abort the removal before anything is deleted. The configuration is removed
-    /// last, so an interrupted removal leaves a sandbox that can be deprovisioned again.
-    pub(crate) fn remove(&self, sandbox_id: &SandboxId) -> Result<()> {
+    /// Unknown files abort the removal before anything is deleted. The configuration goes after
+    /// the instance's files, so an interrupted removal leaves a sandbox that can be deprovisioned
+    /// again, and the lock file goes last, while it is held, so that a transition that waits for
+    /// the lock finds no configuration.
+    pub(crate) fn remove(&self, sandbox_id: &SandboxId, locked: LockedInstance) -> Result<()> {
         let dir = self.dir(sandbox_id);
         let entries = fs::read_dir(&dir).map_err(io_error(format!(
             "cannot list sandbox state {}",
@@ -192,9 +219,12 @@ impl StateStore {
             let name = entry.file_name();
             let name = name.to_string_lossy();
             let temporary = name.starts_with('.') && name.ends_with(".tmp");
-            if instance::FILE_NAMES.contains(&name.as_ref()) || temporary {
+            if name == RECORD_NAME || name == LOCK_NAME {
+                continue;
+            }
+            if FILE_NAMES.contains(&name.as_ref()) || temporary {
                 owned.push(entry.path());
-            } else if name != RECORD_NAME {
+            } else {
                 return Err(Error::backend_error(format!(
                     "sandbox state {} contains the unexpected entry {name:?}; remove it and retry",
                     dir.display()
@@ -205,22 +235,24 @@ impl StateStore {
             instance::remove_if_present(&path)?;
         }
         instance::remove_if_present(&dir.join(RECORD_NAME))?;
-        fs::remove_dir(&dir).map_err(io_error(format!(
-            "cannot remove sandbox state {}",
-            dir.display()
-        )))
+        instance::remove_if_present(&dir.join(LOCK_NAME))?;
+        // The directory goes while the lock is held where it can, and once it is released where
+        // the removed lock file stays until its last handle closes.
+        if !remove_emptied(&dir)? {
+            drop(locked);
+            remove_emptied(&dir)?;
+        }
+        Ok(())
     }
 }
 
 #[cfg(test)]
 mod tests {
-    use std::fs::OpenOptions;
     use std::sync::Arc;
     use std::thread;
-    use std::time::Duration;
+    use std::time::{Duration, Instant};
 
-    use nvx::host::instance::{LaunchRecord, ProcessIdentity, RuntimeRecord};
-    use nvx::protocol::CAPABILITY_LEN;
+    use nvx::ErrorKind;
 
     use super::*;
     use crate::ErrorCode;
@@ -240,6 +272,16 @@ mod tests {
         }
     }
 
+    /// Returns the names of the entries of `dir`, sorted.
+    fn entries(dir: &Path) -> Vec<String> {
+        let mut names: Vec<String> = fs::read_dir(dir)
+            .unwrap()
+            .map(|entry| entry.unwrap().file_name().into_string().unwrap())
+            .collect();
+        names.sort();
+        names
+    }
+
     #[test]
     fn records_round_trip_and_unknown_ids_are_stale() {
         let root = tempfile::tempdir().unwrap();
@@ -248,53 +290,33 @@ mod tests {
         assert_eq!(store.load(&id).unwrap_err().code(), ErrorCode::StaleId);
         store.create(&id, &record()).unwrap();
         assert_eq!(store.load(&id).unwrap(), record());
-        assert!(store.instance(&id).runtime().unwrap().is_none());
+        let (locked, loaded) = store.lock_and_load(&id).unwrap();
+        assert_eq!(loaded, record());
+        assert!(locked.instance().store().runtime().unwrap().is_none());
+        assert_eq!(locked.instance().dir(), store.dir(&id));
+        // A sandbox's ID is random, so its directory is new.
+        let error = store.create(&id, &record()).unwrap_err();
+        assert_eq!(error.code(), ErrorCode::BackendError);
+        assert!(error.message().contains("exists already"), "{error}");
     }
 
     #[test]
-    fn runtime_files_are_cleared_and_state_removed() {
+    fn the_instance_files_and_the_state_are_removed() {
         let root = tempfile::tempdir().unwrap();
         let store = StateStore::open(root.path()).unwrap();
         let id = SandboxId::generate().unwrap();
         store.create(&id, &record()).unwrap();
-        let instance = store.instance(&id);
-        assert!(instance.launch().unwrap().is_none());
-        let launch = LaunchRecord {
-            format: STATE_FORMAT,
-            endpoint: "endpoint".to_owned(),
-            process: None,
-        };
-        instance.write_launch(&launch).unwrap();
-        assert_eq!(instance.launch().unwrap(), Some(launch.clone()));
-        let identified = LaunchRecord {
-            process: Some(ProcessIdentity {
-                pid: 1,
-                start_time: 2,
-            }),
-            ..launch.clone()
-        };
-        instance.write_launch(&identified).unwrap();
-        assert_eq!(instance.launch().unwrap(), Some(identified));
-        instance.remove_launch();
-        assert!(instance.launch().unwrap().is_none());
-        instance.write_launch(&launch).unwrap();
-        let runtime = RuntimeRecord {
-            format: STATE_FORMAT,
-            pid: 1,
-            start_time: 2,
-            endpoint: "endpoint".to_owned(),
-        };
-        instance.write_runtime(&runtime).unwrap();
-        instance.write_capability(&[9; CAPABILITY_LEN]).unwrap();
-        assert_eq!(instance.runtime().unwrap(), Some(runtime));
-        assert_eq!(instance.read_capability().unwrap(), [9; CAPABILITY_LEN]);
-        instance.clear_runtime().unwrap();
-        assert!(instance.runtime().unwrap().is_none());
-        assert!(instance.launch().unwrap().is_none());
-        assert!(instance.read_capability().is_err());
-        drop(instance.create_log().unwrap());
-        store.remove(&id).unwrap();
-        assert!(!store.dir(&id).exists());
+        let (locked, _) = store.lock_and_load(&id).unwrap();
+        let dir = store.dir(&id);
+        // A stopped VM leaves its log and outcome report, and an interrupted replacement of a
+        // record its temporary file.
+        for name in ["openvmm.log", "outcome.json", ".runtime.json.12345.tmp"] {
+            fs::write(dir.join(name), b"left").unwrap();
+        }
+        assert_eq!(store.log_path(&id), dir.join("openvmm.log"));
+        store.remove(&id, locked).unwrap();
+        assert!(!dir.exists());
+        assert!(entries(root.path()).is_empty());
     }
 
     #[test]
@@ -304,7 +326,8 @@ mod tests {
         let id = SandboxId::generate().unwrap();
         store.create(&id, &record()).unwrap();
         fs::write(store.dir(&id).join("keep.txt"), b"user data").unwrap();
-        assert!(store.remove(&id).is_err());
+        let (locked, _) = store.lock_and_load(&id).unwrap();
+        assert!(store.remove(&id, locked).is_err());
         assert!(store.dir(&id).join("keep.txt").exists());
         assert_eq!(store.load(&id).unwrap(), record());
     }
@@ -405,58 +428,58 @@ mod tests {
         let store = StateStore::open(root.path()).unwrap();
         let id = SandboxId::generate().unwrap();
         store.create(&id, &record()).unwrap();
-        let (guard, loaded) = store.lock_and_load(&id).unwrap();
+        let (locked, loaded) = store.lock_and_load(&id).unwrap();
         assert_eq!(loaded, record());
-        let path = store.lock_path(&id);
-        let contender = OpenOptions::new().write(true).open(&path).unwrap();
-        assert!(contender.try_lock().is_err());
-        drop(guard);
-        contender.try_lock().unwrap();
-    }
-
-    fn lock_files(root: &Path) -> usize {
-        fs::read_dir(root.join(LOCKS_NAME)).unwrap().count()
+        // The lock is the lock of the instance's store.
+        let contender = Instance::open(store.dir(&id), id.to_string()).unwrap();
+        let error = contender.lock(Some(Instant::now())).unwrap_err();
+        assert_eq!(error.kind(), ErrorKind::TimedOut, "{error}");
+        drop(locked);
+        drop(contender.lock(Some(Instant::now())).unwrap());
+        assert!(store.dir(&id).join(LOCK_NAME).is_file());
     }
 
     #[test]
-    fn stale_ids_leave_no_lock_files() {
+    fn stale_ids_leave_nothing_behind() {
         let root = tempfile::tempdir().unwrap();
         let store = StateStore::open(root.path()).unwrap();
         let never_provisioned = SandboxId::generate().unwrap();
-        // An interrupted removal can leave an empty directory, which is stale too.
+        // An interrupted removal can leave an empty directory, or one with only its lock file,
+        // which are stale too.
         let emptied = SandboxId::generate().unwrap();
         fs::create_dir(store.dir(&emptied)).unwrap();
-        for id in [&never_provisioned, &emptied] {
+        let locked_only = SandboxId::generate().unwrap();
+        Instance::create(store.dir(&locked_only), locked_only.to_string()).unwrap();
+        fs::write(store.dir(&locked_only).join(LOCK_NAME), b"").unwrap();
+        for id in [&never_provisioned, &emptied, &locked_only] {
             let error = store.lock_and_load(id).unwrap_err();
             assert_eq!(error.code(), ErrorCode::StaleId, "{error}");
         }
-        assert_eq!(lock_files(root.path()), 0);
+        assert!(entries(root.path()).is_empty());
 
         let id = SandboxId::generate().unwrap();
         store.create(&id, &record()).unwrap();
         drop(store.lock_and_load(&id).unwrap());
-        assert_eq!(lock_files(root.path()), 1);
+        assert_eq!(entries(&store.dir(&id)), [RECORD_NAME, LOCK_NAME]);
     }
 
     #[test]
-    fn state_removed_while_waiting_for_the_lock_leaves_no_lock_file() {
+    fn state_removed_while_waiting_for_the_lock_leaves_nothing_behind() {
         let root = tempfile::tempdir().unwrap();
         let store = Arc::new(StateStore::open(root.path()).unwrap());
         let id = SandboxId::generate().unwrap();
         store.create(&id, &record()).unwrap();
-        let (guard, _) = store.lock_and_load(&id).unwrap();
+        let (locked, _) = store.lock_and_load(&id).unwrap();
         let waiter = thread::spawn({
             let (store, id) = (Arc::clone(&store), id.clone());
             move || store.lock_and_load(&id).map(drop)
         });
         // Let the waiter block on the lock, then deprovision as the backend does. A waiter that
-        // starts late finds no state and must leave no lock file either.
+        // starts late finds no state and must leave nothing behind either.
         thread::sleep(Duration::from_millis(100));
-        store.remove(&id).unwrap();
-        drop(guard);
-        store.remove_lock(&id);
+        store.remove(&id, locked).unwrap();
         let error = waiter.join().unwrap().unwrap_err();
         assert_eq!(error.code(), ErrorCode::StaleId, "{error}");
-        assert_eq!(lock_files(root.path()), 0);
+        assert!(entries(root.path()).is_empty());
     }
 }
