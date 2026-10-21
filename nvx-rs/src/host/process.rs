@@ -15,16 +15,12 @@
 //! Linux 5.3 or in sandboxes that refuse them, check the reference at a short interval instead,
 //! until the deadline of the wait, and cannot terminate a process that they cannot hold.
 //!
-//! The [`supervisor`] launches OpenVMM, and its [`Launched::process`] holds the child that it
-//! started through a handle of its own. [`spawn`], [`detach_child`], and [`kill_child`] launch and
-//! release OpenVMM for [`instance`](super::instance), which keeps records of its own: they go
-//! through the supervisor, and remain until it moves to it, as do [`wait_for_exit`] and [`kill`].
+//! The [`supervisor`](super::supervisor) launches OpenVMM, and its
+//! [`Launched::process`](super::supervisor::Launched::process) holds the child that it started
+//! through a handle of its own.
 
-use std::ffi::OsString;
 use std::fmt;
-use std::fs::File;
 use std::io;
-use std::path::Path;
 use std::str::FromStr;
 use std::sync::OnceLock;
 use std::thread;
@@ -33,18 +29,15 @@ use std::time::{Duration, Instant};
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
 
 use super::platform;
-pub use super::supervisor::Launched;
-use super::supervisor::{self, VmmCommand};
 use crate::error::Error;
-use crate::protocol::CAPABILITY_LEN;
 
 /// Longest wait for a terminated OpenVMM process to exit.
 pub(crate) const KILL_TIMEOUT: Duration = Duration::from_secs(10);
-/// Interval at which the exit or identity of a process is polled where no exit event serves: the
-/// exit of any process on Linux hosts without pidfds, and the exit of a child that a [`Launched`]
-/// waits for with a timeout on Linux, since [`std::process::Child`] can wait only without one.
-/// [`wait_for_exit`] also checks again at this interval an identity that it could not read. An
-/// exit is noticed at most this late, for about 40 checks a second.
+/// Interval at which the exit of a process is polled where no exit event serves: the exit of any
+/// process on Linux hosts without pidfds, and the exit of a child that a
+/// [`Launched`](super::supervisor::Launched) waits for with a timeout on Linux, since
+/// [`std::process::Child`] can wait only without one. An exit is noticed at most this late, for
+/// about 40 checks a second.
 pub(crate) const POLL_INTERVAL: Duration = Duration::from_millis(25);
 
 /// The identity of one boot of the host, which changes whenever the host restarts.
@@ -310,107 +303,6 @@ fn poll_exit(deadline: Instant, mut runs: impl FnMut() -> io::Result<bool>) -> i
     }
 }
 
-/// Starts OpenVMM detached from the caller, with `capability` on its standard input, `log` as
-/// its standard output and error, and nothing else of the caller's, as [`supervisor::spawn`]
-/// starts a VMM that inherits no descriptor or handle beyond its standard streams.
-///
-/// On Windows, `breakaway_from_job` starts OpenVMM outside the caller's job object, which must
-/// permit breakaway, so that the VM survives the caller.
-pub fn spawn(
-    openvmm: &Path,
-    breakaway_from_job: bool,
-    arguments: &[OsString],
-    capability: &[u8; CAPABILITY_LEN],
-    log: File,
-    working_dir: &Path,
-) -> io::Result<Launched> {
-    let mut command = VmmCommand::new(openvmm, arguments.to_vec(), working_dir);
-    command.breakaway_from_job = breakaway_from_job;
-    supervisor::spawn(&command, capability, log)
-}
-
-/// Releases a launched process without waiting for it, as [`Launched::detach`] does.
-pub fn detach_child(launched: Launched) {
-    launched.detach();
-}
-
-/// Kills a launched process that was never recorded, through its handle, which cannot race with
-/// process ID reuse, as [`Launched::kill_and_wait`] does. Returns whether it exited within ten
-/// seconds.
-pub fn kill_child(launched: Launched) -> bool {
-    launched.kill_and_wait()
-}
-
-/// Waits until the process with the given identity is gone, returning whether it exited before
-/// `deadline`. Inconclusive checks count as still running.
-///
-/// The process is held and waited for as [`Process::open`] and [`Process::wait`] do, within the
-/// current boot, except that a process whose identity this user may not check counts as exited
-/// wherever [`platform::process_start_time`] says that it has.
-pub fn wait_for_exit(pid: u32, start_time: u64, deadline: Instant) -> bool {
-    loop {
-        match open_identity(pid, start_time) {
-            Ok(None) => return true,
-            Ok(Some(handle)) => {
-                if let Ok(exited) = wait_handle(&handle, pid, start_time, deadline) {
-                    return exited;
-                }
-            }
-            Err(_) => {}
-        }
-        let now = Instant::now();
-        if now >= deadline {
-            return false;
-        }
-        thread::sleep(POLL_INTERVAL.min(deadline - now));
-    }
-}
-
-/// Kills the process and waits up to ten seconds for it to disappear.
-///
-/// The process is held as [`wait_for_exit`] holds it, so it is signaled only if it still has the
-/// identity, and [`Process::kill`] ends it.
-pub fn kill(pid: u32, start_time: u64) -> io::Result<bool> {
-    let Some(handle) = open_identity(pid, start_time)? else {
-        return Ok(true);
-    };
-    handle.kill(pid)?;
-    wait_handle(&handle, pid, start_time, Instant::now() + KILL_TIMEOUT)
-}
-
-/// Opens the process with the identity `pid` and `start_time` for [`wait_for_exit`] and
-/// [`kill`], as [`Process::open`] does within the current boot.
-///
-/// Unlike [`Process::open`], it keeps the rule of [`platform::process_start_time`], which
-/// `host::instance` and the CLI follow: OpenVMM runs as the user that starts it, so a process
-/// that this user may not query on Windows, or that `/proc` hides from it on Linux, has exited.
-fn open_identity(pid: u32, start_time: u64) -> io::Result<Option<platform::ProcessHandle>> {
-    open_identity_with(
-        pid,
-        start_time,
-        platform::open_process,
-        platform::process_start_time,
-    )
-}
-
-/// Opens the process with the identity `pid` and `start_time` with `open`, as [`open_identity`]
-/// does, and when its identity cannot be checked, asks `current` for the start time that
-/// [`platform::process_start_time`] reports.
-fn open_identity_with<H>(
-    pid: u32,
-    start_time: u64,
-    open: impl FnOnce(u32, u64) -> io::Result<Option<H>>,
-    current: impl FnOnce(u32) -> io::Result<Option<u64>>,
-) -> io::Result<Option<H>> {
-    match open(pid, start_time) {
-        Err(error) if error.kind() == io::ErrorKind::PermissionDenied => match current(pid)? {
-            Some(current) if current == start_time => Err(error),
-            _ => Ok(None),
-        },
-        result => result,
-    }
-}
-
 #[cfg(test)]
 mod reference_tests {
     use serde_json::json;
@@ -540,43 +432,6 @@ mod reference_tests {
             |pid, start_time| Ok(Some((pid, start_time))),
         );
         assert_eq!(opened.unwrap(), Some((7, 42)));
-    }
-
-    #[test]
-    fn identities_that_cannot_be_checked_have_exited_where_start_times_say_so() {
-        let hidden = |_: u32, _: u64| {
-            Err::<Option<()>, _>(io::Error::new(io::ErrorKind::PermissionDenied, "hidden"))
-        };
-        // The start time shows no process with the ID, or another one, so the process exited.
-        let gone = open_identity_with(7, 42, hidden, |_| Ok(None));
-        assert!(gone.unwrap().is_none());
-        let reused = open_identity_with(7, 42, hidden, |_| Ok(Some(43)));
-        assert!(reused.unwrap().is_none());
-        // The start time shows the process, or cannot be read, so its state is unknown.
-        let running = open_identity_with(7, 42, hidden, |_| Ok(Some(42)));
-        assert_eq!(running.unwrap_err().to_string(), "hidden");
-        let unreadable = open_identity_with(7, 42, hidden, |_| Err(io::Error::other("unreadable")));
-        assert_eq!(unreadable.unwrap_err().to_string(), "unreadable");
-        // Any other outcome of the open stands.
-        let unasked = |_: u32| -> io::Result<Option<u64>> {
-            panic!("only an identity that cannot be checked asks for the start time")
-        };
-        let opened = open_identity_with(
-            7,
-            42,
-            |pid, start_time| Ok(Some((pid, start_time))),
-            unasked,
-        );
-        assert_eq!(opened.unwrap(), Some((7, 42)));
-        let exited = open_identity_with(7, 42, |_, _| Ok(None::<()>), unasked);
-        assert!(exited.unwrap().is_none());
-        let failed = open_identity_with(
-            7,
-            42,
-            |_, _| Err::<Option<()>, _>(io::Error::other("failed")),
-            unasked,
-        );
-        assert_eq!(failed.unwrap_err().to_string(), "failed");
     }
 
     #[test]
@@ -792,13 +647,20 @@ mod tests {
             thread::sleep(POLL_INTERVAL);
         }
         assert_eq!(platform::process_start_time(pid).unwrap(), Some(start_time));
-        assert!(!wait_for_exit(
+        let process = Process::open(&ProcessRef {
             pid,
             start_time,
-            Instant::now() + Duration::from_millis(100)
-        ));
+            boot: BootId::current().unwrap(),
+        })
+        .unwrap()
+        .expect("a process whose main thread exited still runs");
+        assert!(
+            !process
+                .wait(Instant::now() + Duration::from_millis(100))
+                .unwrap()
+        );
         child.0.kill().unwrap();
         child.0.wait().unwrap();
-        assert!(wait_for_exit(pid, start_time, Instant::now()));
+        assert!(process.wait(Instant::now()).unwrap());
     }
 }

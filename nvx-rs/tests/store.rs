@@ -20,11 +20,12 @@ use std::time::{Duration, Instant};
 
 use nvx::ErrorKind;
 use nvx::host::platform;
-use nvx::host::process::{self, Launched, Process};
+use nvx::host::process::{BootId, Process, ProcessRef};
 use nvx::host::store::{
     ArtifactIdentity, IdentityCheck, IdentityPart, JOURNAL_NAME, Launch, LaunchState, LockedStore,
     RUNTIME_NAME, Recovery, RuntimeIdentity, SandboxStore,
 };
+use nvx::host::supervisor::{self, Launched, VmmCommand};
 use nvx::protocol::CAPABILITY_LEN;
 
 /// The capability of every launch of these tests.
@@ -110,7 +111,12 @@ fn role(name: &str, extra: &[&str]) -> (PathBuf, Vec<OsString>) {
 fn spawn_vmm(launch: &mut Launch<'_>, store: &SandboxStore) -> Launched {
     let (program, arguments) = role("vmm_role", &[VMM_MARKER]);
     let log = launch.take_log().unwrap();
-    process::spawn(&program, false, &arguments, &CAPABILITY, log, store.dir()).unwrap()
+    supervisor::spawn(
+        &VmmCommand::new(program, arguments, store.dir()),
+        &CAPABILITY,
+        log,
+    )
+    .unwrap()
 }
 
 /// Spawns the fake OpenVMM, which serves the endpoint of `launch` after `boot_delay_ms`, with the
@@ -134,13 +140,10 @@ fn spawn_fake(launch: &mut Launch<'_>, store: &SandboxStore, boot_delay_ms: u64)
         .openvmm_arguments(launch.endpoint(), &store.outcome_path())
         .unwrap();
     let log = launch.take_log().unwrap();
-    process::spawn(
-        &spec.openvmm,
-        false,
-        &arguments,
+    supervisor::spawn(
+        &VmmCommand::new(&spec.openvmm, arguments, store.dir()),
         &CAPABILITY,
         log,
-        store.dir(),
     )
     .unwrap()
 }
@@ -158,7 +161,7 @@ impl Vmm {
 impl Drop for Vmm {
     fn drop(&mut self) {
         if let Some(launched) = self.0.take() {
-            process::kill_child(launched);
+            launched.kill_and_wait();
         }
     }
 }
@@ -166,6 +169,21 @@ impl Drop for Vmm {
 /// Returns whether the process `pid` still runs with the start time `start_time`.
 fn runs(pid: u32, start_time: u64) -> bool {
     platform::process_start_time(pid).unwrap() == Some(start_time)
+}
+
+/// Ends the process `pid` that started at `start_time` in this boot, through its verified
+/// handle, if it still runs, and returns whether it exited within [`RECOVERY_TIMEOUT`].
+fn kill(pid: u32, start_time: u64) -> io::Result<bool> {
+    let reference = ProcessRef {
+        pid,
+        start_time,
+        boot: BootId::current()?,
+    };
+    let Some(process) = Process::open(&reference)? else {
+        return Ok(true);
+    };
+    process.kill()?;
+    process.wait(Instant::now() + RECOVERY_TIMEOUT)
 }
 
 /// A VMM that a crashed orchestrator left behind, which is killed when the test ends if it still
@@ -186,7 +204,7 @@ impl Orphan {
 
 impl Drop for Orphan {
     fn drop(&mut self) {
-        let _ = process::kill(self.pid, self.start_time);
+        let _ = kill(self.pid, self.start_time);
     }
 }
 
@@ -403,7 +421,7 @@ fn the_log_claim_proves_that_an_unrecorded_vmm_exited() {
     assert!(store.read_capability().is_ok());
     assert!(vmm.runs());
     // Once the VMM exits, its released claim proves it.
-    assert!(process::kill(vmm.pid, vmm.start_time).unwrap());
+    assert!(kill(vmm.pid, vmm.start_time).unwrap());
     assert_eq!(recover_until_determinate(&mut locked), Recovery::Exited);
     assert!(store.journal().unwrap().is_none());
 }
@@ -529,7 +547,7 @@ fn an_abandoned_launch_ends_its_recorded_vmm() {
     assert!(!runs(process.pid, process.start_time));
     assert!(store.journal().unwrap().is_none());
     // The caller still releases the child that it holds.
-    process::detach_child(vmm.0.take().unwrap());
+    vmm.0.take().unwrap().detach();
 }
 
 #[cfg(feature = "testing")]
@@ -591,7 +609,7 @@ fn an_endpoint_served_without_the_claimed_log_is_not_signaled() {
     assert!(reason.contains("does not hold its log"), "{reason}");
     assert!(runs(fake_process.pid, fake_process.start_time));
     assert!(vmm.runs());
-    assert!(process::kill(vmm.pid, vmm.start_time).unwrap());
+    assert!(kill(vmm.pid, vmm.start_time).unwrap());
     assert_eq!(recover_until_determinate(&mut locked), Recovery::Exited);
     drop(fake);
 }

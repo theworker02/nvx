@@ -28,7 +28,7 @@ use std::sync::{Mutex, MutexGuard, PoisonError, mpsc};
 use std::thread;
 use std::time::{Duration, Instant};
 
-use nvx::host::process::{self, BootId, Process, ProcessRef, WaitMethod};
+use nvx::host::process::{BootId, Process, ProcessRef, WaitMethod};
 #[cfg(windows)]
 use nvx::host::store::FORMAT;
 use nvx::host::store::{
@@ -681,13 +681,6 @@ fn a_reused_process_id_is_never_signaled() {
             "{impostor:?} names a running process"
         );
     }
-    // The functions that take a process ID and a start time do not signal it either.
-    assert!(process::kill(reference.pid, reference.start_time + 1).unwrap());
-    assert!(process::wait_for_exit(
-        reference.pid,
-        reference.start_time + 1,
-        Instant::now()
-    ));
 
     // The process that has the ID still runs.
     assert!(!process.has_exited().unwrap());
@@ -1423,14 +1416,6 @@ fn a_process_that_this_user_may_not_query_has_an_unknown_state() {
     // Its identity cannot be checked, so it may still run.
     let error = Process::open(&reference).unwrap_err();
     assert_eq!(error.kind(), io::ErrorKind::PermissionDenied);
-    // The entry points by identity count it as exited, as `process_start_time` does, and leave
-    // it running.
-    assert!(process::wait_for_exit(
-        reference.pid,
-        reference.start_time,
-        Instant::now()
-    ));
-    assert!(process::kill(reference.pid, reference.start_time).unwrap());
     assert!(
         child.0.try_wait().unwrap().is_none(),
         "the process was ended"
