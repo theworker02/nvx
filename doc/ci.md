@@ -185,7 +185,7 @@ every backend; each job takes about five minutes on its own runner, in parallel
 with the other microVM jobs. The jobs gate the required status check, the
 development release, and performance persistence. The GitHub-hosted `debug-kernel` job
 builds the debug kernel beside the shared `artifacts` job
-(`build-guest-artifacts` with `guest-images: "false"`) and caches it under its
+(`build-guest-artifacts` with `components: debug-kernel`) and caches it under its
 own key, so a kernel rebuild delays only the debug jobs, and a failed debug
 kernel build fails the required status check and blocks the release.
 

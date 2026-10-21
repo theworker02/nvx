@@ -5532,8 +5532,7 @@ python3() {
         # artifacts, under the same condition, and only the debug jobs wait.
         debug_build = _workflow_job(workflow, "debug-kernel")
         self.assertIn("runs-on: ubuntu-latest", debug_build)
-        self.assertIn('debug-kernel: "true"', debug_build)
-        self.assertIn('guest-images: "false"', debug_build)
+        self.assertIn("components: debug-kernel\n", debug_build)
         self.assertIn("name: guest-debug-kernel", debug_build)
         for name in (
             KernelBuildConstants.DEBUG_BINARY_NAME,
@@ -10620,11 +10619,12 @@ class BuildTests(unittest.TestCase):
         )
         self.assertNotIn("config-microvm-debug", kernel_input)
         build_step = _composite_action_step(action, "Build Linux debug kernel (Docker)")
-        self.assertIn("inputs.debug-kernel == 'true'", build_step)
+        self.assertIn("steps.components.outputs.debug-kernel == 'true'", build_step)
         self.assertIn(
             f"--target {DockerBuildConstants.DEBUG_KERNEL_TARGET}", build_step
         )
-        self.assertIn('default: "false"', action)
+        components = yaml.safe_load(action)["inputs"]["components"]
+        self.assertNotIn("debug-kernel", components["default"].split())
         for name in DockerBuildConstants.DEBUG_KERNEL_ARTIFACT_NAMES:
             with self.subTest(artifact=name):
                 self.assertEqual(
@@ -10634,7 +10634,10 @@ class BuildTests(unittest.TestCase):
                     2,
                 )
 
-    def test_ci_guest_images_input_leaves_only_the_debug_kernel(self):
+    def test_ci_guest_artifact_components_select_their_steps(self):
+        # Each component's restore, build, and save steps follow its own
+        # selection, so that jobs beside one another can each build some
+        # components without building or saving the others.
         action = (
             BuildConstants.REPO_ROOT
             / ".github"
@@ -10642,24 +10645,130 @@ class BuildTests(unittest.TestCase):
             / "build-guest-artifacts"
             / "action.yml"
         ).read_text(encoding="utf-8")
-        guard = "inputs.guest-images == 'true'"
-        self.assertIn("  guest-images:\n", action)
-        self.assertIn('default: "true"', action)
+        components = yaml.safe_load(action)["inputs"]["components"]
+        # Copilot sessions restore every guest image, but not the CI-only
+        # debug kernel, through the default.
+        self.assertEqual(
+            components["default"].split(), ["kernel", "alpine", "ubuntu", "azurelinux"]
+        )
+        self.assertNotIn("guest-images:", action)
+        self.assertNotIn("inputs.debug-kernel", action)
         steps = [
             line.strip().removeprefix("- name: ")
             for line in action.splitlines()
             if line.startswith("    - name: ")
         ]
-        debug_steps = {name for name in steps if "debug kernel" in name}
-        self.assertEqual(len(debug_steps), 3)
-        always = {"Resolve guest artifact versions", "Resolve guest cache keys"}
+        self.assertEqual(steps[0], "Select guest artifact components")
+        always = {
+            "Select guest artifact components",
+            "Resolve guest artifact versions",
+            "Resolve guest cache keys",
+        }
+        owners = (
+            ("debug kernel", "debug-kernel"),
+            ("Linux kernel", "kernel"),
+            ("Alpine", "alpine"),
+            ("Azure Linux", "azurelinux"),
+            ("Ubuntu", "ubuntu"),
+        )
+
+        def required(expression: str) -> list[str]:
+            # The top-level conjuncts, and those of parenthesized conjunctions.
+            conjuncts: list[str] = []
+            for conjunct in _expression_conjuncts(expression):
+                if _outer_parentheses_enclose(conjunct):
+                    inner = conjunct.strip()[1:-1]
+                    if len(_expression_conjuncts(inner)) > 1:
+                        conjuncts.extend(required(inner))
+                        continue
+                conjuncts.append(conjunct)
+            return conjuncts
+
+        selected: dict[str, int] = {}
         for name in steps:
             with self.subTest(step=name):
                 step = _composite_action_step(action, name)
-                if name in debug_steps or name in always:
-                    self.assertNotIn("guest-images", step)
-                else:
-                    self.assertIn(guard, step)
+                if name in always:
+                    self.assertNotIn("steps.components.outputs.", step)
+                    continue
+                owner = next(component for key, component in owners if key in name)
+                selected[owner] = selected.get(owner, 0) + 1
+                selections = re.findall(
+                    r"steps\.components\.outputs\.([a-z-]+) == 'true'", step
+                )
+                self.assertEqual(selections, [owner])
+                self.assertIn(
+                    f"steps.components.outputs.{owner} == 'true'",
+                    required(_yaml_scalar(step, "if")),
+                )
+        self.assertEqual(
+            selected,
+            {
+                "kernel": 3,
+                "debug-kernel": 3,
+                "alpine": 3,
+                "azurelinux": 3,
+                # The initramfs, the distro layer, their determinism check,
+                # and the sandbox scratch template.
+                "ubuntu": 8,
+            },
+        )
+
+    @unittest.skipUnless(os.name == "posix", "requires bash")
+    def test_ci_guest_artifact_component_selection_fails_closed(self):
+        action = (
+            BuildConstants.REPO_ROOT
+            / ".github"
+            / "actions"
+            / "build-guest-artifacts"
+            / "action.yml"
+        ).read_text(encoding="utf-8")
+        script = _composite_action_script(action, "Select guest artifact components")
+        names = ("kernel", "alpine", "ubuntu", "azurelinux", "debug-kernel")
+        cases = (
+            (
+                "kernel alpine ubuntu azurelinux",
+                {"kernel", "alpine", "ubuntu", "azurelinux"},
+            ),
+            ("debug-kernel", {"debug-kernel"}),
+            ("  ubuntu\nazurelinux  ", {"ubuntu", "azurelinux"}),
+            ("kernel kernel", {"kernel"}),
+            ("", None),
+            ("   ", None),
+            ("kernel bogus", None),
+            ("Kernel", None),
+            ("kernel,alpine", None),
+            ("*", None),
+        )
+        for components, expected in cases:
+            with (
+                self.subTest(components=components),
+                tempfile.TemporaryDirectory() as temporary,
+            ):
+                output = Path(temporary) / "output"
+                # A glob that matched a file would select its name.
+                (Path(temporary) / "kernel").touch()
+                result = subprocess.run(
+                    ["bash", "-c", script],
+                    cwd=temporary,
+                    env={
+                        **os.environ,
+                        "COMPONENTS": components,
+                        "GITHUB_OUTPUT": os.fspath(output),
+                    },
+                    capture_output=True,
+                    text=True,
+                    check=False,
+                )
+                if expected is None:
+                    self.assertNotEqual(result.returncode, 0)
+                    self.assertIn("::error::", result.stderr)
+                    continue
+                self.assertEqual(result.returncode, 0, result.stderr)
+                self.assertEqual(
+                    output.read_text(encoding="utf-8").splitlines(),
+                    [f"{name}={str(name in expected).lower()}" for name in names],
+                )
 
     def test_ci_guest_cache_keys_include_shared_build_modules(self):
         action = (

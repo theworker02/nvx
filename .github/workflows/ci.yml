@@ -428,8 +428,7 @@ jobs:
       - name: Build the CI debug kernel
         uses: ./.github/actions/build-guest-artifacts
         with:
-          debug-kernel: "true"
-          guest-images: "false"
+          components: debug-kernel
           save-cache: ${{ github.event_name == 'pull_request' || github.event_name == 'push' }}
 
       - name: Upload guest debug kernel

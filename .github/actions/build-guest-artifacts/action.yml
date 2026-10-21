@@ -2,6 +2,15 @@ name: Build guest artifacts
 description: Cache or build the pinned Linux kernel and guest images
 
 inputs:
+  components:
+    description: >-
+      Space-separated guest artifacts to cache or build, so that jobs beside
+      one another can each build some of them: kernel, alpine (the Alpine
+      initramfs), ubuntu (the Ubuntu initramfs, its EROFS distro layer, and
+      the sandbox scratch template), azurelinux (the Azure Linux initramfs),
+      and debug-kernel (the CI debug kernel, build/vmlinux-debug)
+    required: false
+    default: kernel alpine ubuntu azurelinux
   restore-only:
     description: >-
       Only restore cached artifacts; skip Docker builds, determinism checks,
@@ -12,16 +21,6 @@ inputs:
     description: >-
       Save the artifacts that miss the cache once they are built; "false"
       still builds them but leaves the cache unchanged
-    required: false
-    default: "true"
-  debug-kernel:
-    description: Also cache or build the CI debug kernel (build/vmlinux-debug)
-    required: false
-    default: "false"
-  guest-images:
-    description: >-
-      Cache or build the kernel and guest images; "false" with debug-kernel
-      builds only the CI debug kernel, for a job that runs beside this one
     required: false
     default: "true"
 
@@ -48,6 +47,39 @@ outputs:
 runs:
   using: composite
   steps:
+    # An unknown name fails here rather than silently selecting nothing.
+    - name: Select guest artifact components
+      id: components
+      shell: bash
+      env:
+        COMPONENTS: ${{ inputs.components }}
+      run: |
+        set -euo pipefail
+        set -o noglob
+        selected=" "
+        for component in ${COMPONENTS}; do
+          case "${component}" in
+            kernel | alpine | ubuntu | azurelinux | debug-kernel)
+              selected+="${component} "
+              ;;
+            *)
+              echo "::error::Unknown guest artifact component: ${component}" >&2
+              exit 1
+              ;;
+          esac
+        done
+        if [[ "${selected}" == " " ]]; then
+          echo "::error::No guest artifact component is selected" >&2
+          exit 1
+        fi
+        for component in kernel alpine ubuntu azurelinux debug-kernel; do
+          if [[ "${selected}" == *" ${component} "* ]]; then
+            echo "${component}=true"
+          else
+            echo "${component}=false"
+          fi
+        done >> "${GITHUB_OUTPUT}"
+
     - name: Resolve guest artifact versions
       id: guest-versions
       shell: bash
@@ -102,7 +134,7 @@ runs:
 
     - name: Restore Linux kernel (zstd)
       id: cache-linux-kernel-zstd
-      if: inputs.guest-images == 'true'
+      if: steps.components.outputs.kernel == 'true'
       uses: actions/cache/restore@v5
       with:
         path: |
@@ -114,7 +146,7 @@ runs:
 
     - name: Restore Alpine disk image (zstd)
       id: cache-alpine-image-zstd
-      if: inputs.guest-images == 'true'
+      if: steps.components.outputs.alpine == 'true'
       uses: actions/cache/restore@v5
       with:
         path: |
@@ -126,7 +158,7 @@ runs:
 
     - name: Restore Ubuntu initramfs (zstd)
       id: cache-ubuntu-initramfs-zstd
-      if: inputs.guest-images == 'true'
+      if: steps.components.outputs.ubuntu == 'true'
       uses: actions/cache/restore@v5
       with:
         path: |
@@ -137,7 +169,7 @@ runs:
 
     - name: Restore Ubuntu distro layer (zstd)
       id: cache-ubuntu-distro-zstd
-      if: inputs.guest-images == 'true'
+      if: steps.components.outputs.ubuntu == 'true'
       uses: actions/cache/restore@v5
       with:
         path: |
@@ -148,7 +180,7 @@ runs:
 
     - name: Restore Azure Linux initramfs (zstd)
       id: cache-azurelinux-initramfs-zstd
-      if: inputs.guest-images == 'true'
+      if: steps.components.outputs.azurelinux == 'true'
       uses: actions/cache/restore@v5
       with:
         path: |
@@ -160,7 +192,7 @@ runs:
     - name: Build Linux kernel (Docker)
       if: >-
         inputs.restore-only != 'true' &&
-        inputs.guest-images == 'true' &&
+        steps.components.outputs.kernel == 'true' &&
         steps.cache-linux-kernel-zstd.outputs.cache-hit != 'true'
       shell: bash
       run: >-
@@ -174,7 +206,7 @@ runs:
       if: >-
         inputs.restore-only != 'true' &&
         inputs.save-cache == 'true' &&
-        inputs.guest-images == 'true' &&
+        steps.components.outputs.kernel == 'true' &&
         steps.cache-linux-kernel-zstd.outputs.cache-hit != 'true'
       uses: actions/cache/save@v5
       with:
@@ -187,7 +219,7 @@ runs:
 
     - name: Restore Linux debug kernel (zstd)
       id: cache-linux-debug-kernel-zstd
-      if: inputs.debug-kernel == 'true'
+      if: steps.components.outputs.debug-kernel == 'true'
       uses: actions/cache/restore@v5
       with:
         path: |
@@ -200,7 +232,7 @@ runs:
     - name: Build Linux debug kernel (Docker)
       if: >-
         inputs.restore-only != 'true' &&
-        inputs.debug-kernel == 'true' &&
+        steps.components.outputs.debug-kernel == 'true' &&
         steps.cache-linux-debug-kernel-zstd.outputs.cache-hit != 'true'
       shell: bash
       run: >-
@@ -214,7 +246,7 @@ runs:
       if: >-
         inputs.restore-only != 'true' &&
         inputs.save-cache == 'true' &&
-        inputs.debug-kernel == 'true' &&
+        steps.components.outputs.debug-kernel == 'true' &&
         steps.cache-linux-debug-kernel-zstd.outputs.cache-hit != 'true'
       uses: actions/cache/save@v5
       with:
@@ -228,7 +260,7 @@ runs:
     - name: Build Alpine disk image (Docker)
       if: >-
         inputs.restore-only != 'true' &&
-        inputs.guest-images == 'true' &&
+        steps.components.outputs.alpine == 'true' &&
         steps.cache-alpine-image-zstd.outputs.cache-hit != 'true'
       shell: bash
       run: >-
@@ -242,7 +274,7 @@ runs:
       if: >-
         inputs.restore-only != 'true' &&
         inputs.save-cache == 'true' &&
-        inputs.guest-images == 'true' &&
+        steps.components.outputs.alpine == 'true' &&
         steps.cache-alpine-image-zstd.outputs.cache-hit != 'true'
       uses: actions/cache/save@v5
       with:
@@ -256,7 +288,7 @@ runs:
     - name: Build Ubuntu initramfs (Docker)
       if: >-
         inputs.restore-only != 'true' &&
-        inputs.guest-images == 'true' &&
+        steps.components.outputs.ubuntu == 'true' &&
         steps.cache-ubuntu-initramfs-zstd.outputs.cache-hit != 'true'
       shell: bash
       run: >-
@@ -270,7 +302,7 @@ runs:
       if: >-
         inputs.restore-only != 'true' &&
         (
-          inputs.guest-images == 'true' &&
+          steps.components.outputs.ubuntu == 'true' &&
           (
             steps.cache-ubuntu-initramfs-zstd.outputs.cache-hit != 'true' ||
             steps.cache-ubuntu-distro-zstd.outputs.cache-hit != 'true'
@@ -287,7 +319,7 @@ runs:
       if: >-
         inputs.restore-only != 'true' &&
         inputs.save-cache == 'true' &&
-        inputs.guest-images == 'true' &&
+        steps.components.outputs.ubuntu == 'true' &&
         steps.cache-ubuntu-initramfs-zstd.outputs.cache-hit != 'true'
       uses: actions/cache/save@v5
       with:
@@ -300,7 +332,7 @@ runs:
     - name: Build Azure Linux initramfs (Docker)
       if: >-
         inputs.restore-only != 'true' &&
-        inputs.guest-images == 'true' &&
+        steps.components.outputs.azurelinux == 'true' &&
         steps.cache-azurelinux-initramfs-zstd.outputs.cache-hit != 'true'
       shell: bash
       env:
@@ -319,7 +351,7 @@ runs:
       if: >-
         inputs.restore-only != 'true' &&
         inputs.save-cache == 'true' &&
-        inputs.guest-images == 'true' &&
+        steps.components.outputs.azurelinux == 'true' &&
         steps.cache-azurelinux-initramfs-zstd.outputs.cache-hit != 'true'
       uses: actions/cache/save@v5
       with:
@@ -332,7 +364,7 @@ runs:
     - name: Build Ubuntu distro layer (Docker)
       if: >-
         inputs.restore-only != 'true' &&
-        inputs.guest-images == 'true' &&
+        steps.components.outputs.ubuntu == 'true' &&
         steps.cache-ubuntu-distro-zstd.outputs.cache-hit != 'true'
       shell: bash
       run: >-
@@ -346,7 +378,7 @@ runs:
       if: >-
         inputs.restore-only != 'true' &&
         inputs.save-cache == 'true' &&
-        inputs.guest-images == 'true' &&
+        steps.components.outputs.ubuntu == 'true' &&
         steps.cache-ubuntu-distro-zstd.outputs.cache-hit != 'true'
       uses: actions/cache/save@v5
       with:
@@ -357,7 +389,7 @@ runs:
         enableCrossOsArchive: true
 
     - name: Prepare Ubuntu sandbox scratch template
-      if: inputs.guest-images == 'true'
+      if: steps.components.outputs.ubuntu == 'true'
       shell: bash
       run: |
         set -euo pipefail

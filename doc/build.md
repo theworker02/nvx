@@ -326,7 +326,7 @@ build/vmlinux-debug.provenance.json
 Its provenance has the production fields plus a `debug_config_fragment` path
 and SHA-256. The debug kernel is a CI artifact and is never packaged. The
 `build-guest-artifacts` action caches and builds it only when its
-`debug-kernel` input is `true`.
+`components` input names `debug-kernel`.
 
 Release packaging needs the OpenVMM binary, the guest artifacts in the layout
 below, and the OpenVMM, kernel, and Alpine initramfs provenance sidecars, so run
