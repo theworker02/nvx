@@ -336,6 +336,25 @@ def parse_cpu_profile_fallback(output: str) -> str | None:
     return match.group(1)
 
 
+def cpu_profile_guidance_applies(cpu_profile: str | None, host: HostCpu | None) -> bool:
+    """Return whether host_cpu_profile_guidance has guidance for a cold boot
+    with ``--cpu-profile cpu_profile``, or with its default, ``auto``, if
+    ``cpu_profile`` is None, on the CPU ``host``: whether no built-in profile
+    serves the CPU, and the profile is ``auto``, or ``host`` on a CPU of a
+    vendor that host profiles do not serve either. A caller can then skip
+    looking up the guidance's other inputs."""
+    if host is None or (
+        cpu_generation(host.vendor, host.family, host.model, host.stepping) is not None
+    ):
+        return False
+    if cpu_profile in (None, "auto"):
+        return True
+    return (
+        cpu_profile == HOST_PROFILE_GENERATION
+        and host.vendor not in HOST_PROFILE_VENDORS
+    )
+
+
 def host_cpu_profile_guidance(
     cpu_profile: str | None, host: HostCpu | None, openvmm: str, hypervisor: str
 ) -> str | None:
@@ -353,15 +372,11 @@ def host_cpu_profile_guidance(
     profile ID fails with its own code, and ``host`` on an Intel or AMD CPU
     with OpenVMM's own explanation, which need no guidance. OpenVMM keeps its
     standard error on the terminal, so the caller cannot read the code that
-    ended the run."""
-    if host is None or (
-        cpu_generation(host.vendor, host.family, host.model, host.stepping) is not None
-    ):
+    ended the run; cpu_profile_guidance_applies tells whether there is
+    guidance."""
+    if host is None or not cpu_profile_guidance_applies(cpu_profile, host):
         return None
     host_profiles = host.vendor in HOST_PROFILE_VENDORS
-    auto = cpu_profile in (None, "auto")
-    if not (auto or (cpu_profile == HOST_PROFILE_GENERATION and not host_profiles)):
-        return None
     unserved = f"nvx: no built-in CPU profile serves this host's CPU, {host.describe()}"
     generations = f"the built-in profiles cover {describe_cpu_generations()}."
     if not host_profiles:

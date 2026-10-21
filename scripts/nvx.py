@@ -69,7 +69,6 @@ from nvx_tools.collect_ubuntu_sources import (
 from nvx_tools.common import (
     ScriptError,
     artifact_path,
-    require_file,
 )
 from nvx_tools.create_linux_source_archive import (
     configure_parser as configure_linux_source_archive_parser,
@@ -93,28 +92,18 @@ from nvx_tools.release import (
     package_release,
     verify_source_tree,
 )
-from nvx_tools.sandbox import (
-    AGGREGATE_MOUNT_TARGET,
-    MOUNT_OWNERS,
-    MOUNT_POLICY_OPTIONS,
-    SANDBOX_COMMAND_LINE_MAX_SIZE,
-    aggregate_child_argument,
-    aggregate_child_name,
-    aggregate_command_line_fragment,
-    aggregate_share_tokens,
-    mount_argument,
-    mount_kind,
-    parse_mount_value,
-    require_mount_owner_supported,
-)
 from nvx_tools.time_abi import (
     benchmark_cpu_profile_refusal,
+    cpu_profile_guidance_applies,
     host_cpu_profile_guidance,
     openvmm_cpu_generations,
 )
 
 DEFAULT_RELEASE_REPOSITORY = "microsoft/nvx"
 HYPERVISORS = ("auto", "whp", "kvm", "mshv")
+# `vmm` performs every share operation as OpenVMM; `caller` performs each as the
+# guest caller's identity, with guest root squashed to the share owner.
+MOUNT_OWNERS = ("vmm", "caller")
 NETWORK_PROFILES = ("portable",)
 NETWORK_EGRESS_RULE_METAVAR = "CIDR[:PROTOCOL[:PORT[-PORT]]]"
 NETWORK_EGRESS_RULE_HELP = (
@@ -123,24 +112,21 @@ NETWORK_EGRESS_RULE_HELP = (
     "PORT-PORT; repeat to add rules"
 )
 SANDBOX_OPERATIONS = ("run", "provision", "start", "exec", "stop", "deprovision")
-# The namespace attribute in which the sandbox parser records its options.
-SANDBOX_ARGUMENTS = "sandbox_arguments"
+# The namespace attribute in which the run and sandbox parsers record their
+# options for nvx-rs.
+NVX_RS_ARGUMENTS = "nvx_rs_arguments"
 
 
-def _mount_policy_destination(option: str) -> str:
-    """Return the argparse destination of a share access-policy option."""
-    return option.removeprefix("--").replace("-", "_")
-
-
-class _SandboxOption(argparse.Action):
-    """Record an option of `nvx.py sandbox` for nvx-rs, which checks and uses
-    every value.
+class _NvxRsOption(argparse.Action):
+    """Record an option of `nvx.py run` or `nvx.py sandbox` for nvx-rs, which
+    checks and uses every value.
 
     argparse resolves abbreviations and the --option=VALUE form, so nvx-rs
     receives each option under its canonical name, in command-line order,
-    which attributes each --mount-deny, --mount-allow, and --mount-write to the
-    --mount before it, and with its value attached, so that a value that
-    starts with "-" stays a value.
+    which attributes each --mount-deny, --mount-allow, and --mount-write of
+    `sandbox` to the --mount before it, and with its value attached, so that a
+    value that starts with "-" stays a value. With `keep`, the value, or `True`
+    for a flag, also goes to the option's destination, where nvx.py reads it.
     """
 
     def __init__(
@@ -148,11 +134,14 @@ class _SandboxOption(argparse.Action):
         option_strings: Sequence[str],
         dest: str,
         nargs: int | str | None = None,
+        *,
+        keep: bool = False,
         **kwargs: Any,
     ) -> None:
         super().__init__(
             option_strings, dest, nargs=nargs, default=argparse.SUPPRESS, **kwargs
         )
+        self.keep = keep
 
     def __call__(
         self,
@@ -163,37 +152,10 @@ class _SandboxOption(argparse.Action):
     ) -> None:
         name = self.option_strings[0]
         argument = name if self.nargs == 0 else f"{name}={cast(str, values)}"
-        recorded = cast(list[str], getattr(namespace, SANDBOX_ARGUMENTS, None) or [])
-        setattr(namespace, SANDBOX_ARGUMENTS, [*recorded, argument])
-
-
-def _validate_run_share_targets(targets: list[str]) -> None:
-    """Reject guest targets that the guest cannot bind from an aggregate:
-    targets that do not survive the kernel command line, or that hide each
-    other or the aggregate itself."""
-    for index, target in enumerate(targets):
-        if (
-            not target.startswith("/")
-            or target == "/"
-            or any(character.isspace() or character in "\0\\=," for character in target)
-            or any(part in ("", ".", "..") for part in target.split("/")[1:])
-        ):
-            raise ScriptError(
-                f"invalid --mount target {target!r}: with several shares, or a "
-                "shared file, each target must be an absolute non-root path "
-                "without empty, dot, or parent components, whitespace, '\\', '=', "
-                "or ','"
-            )
-        for other in (AGGREGATE_MOUNT_TARGET, *targets[:index]):
-            if (
-                target == other
-                or target.startswith(f"{other}/")
-                or other.startswith(f"{target}/")
-            ):
-                raise ScriptError(
-                    f"--mount targets {other} and {target} overlap; a share "
-                    "cannot hide another"
-                )
+        recorded = cast(list[str], getattr(namespace, NVX_RS_ARGUMENTS, None) or [])
+        setattr(namespace, NVX_RS_ARGUMENTS, [*recorded, argument])
+        if self.keep:
+            setattr(namespace, self.dest, True if self.nargs == 0 else values)
 
 
 def _run(
@@ -416,223 +378,45 @@ def _format_command(command: list[str]) -> str:
     return subprocess.list2cmdline(command) if os.name == "nt" else shlex.join(command)
 
 
-def _resolve_network_egress_rules(
-    args: argparse.Namespace,
-) -> tuple[tuple[str, ...], tuple[str, ...]]:
-    policy_path = args.network_egress_policy_file
-    explicit_allow = tuple(args.network_egress_allow)
-    explicit_deny = tuple(args.network_egress_deny)
-    if policy_path is None:
-        return explicit_allow, explicit_deny
-    if explicit_allow or explicit_deny:
-        raise ScriptError(
-            "--network-egress-policy-file cannot be combined with "
-            "--network-egress-allow or --network-egress-deny"
-        )
-    if args.network_egress is None:
-        raise ScriptError(
-            "--network-egress is required with --network-egress-policy-file"
-        )
-    compiled = nvx_rs.compile_egress_policy(policy_path)
-    return compiled.allow, compiled.deny
+def _cold_boot_guidance(args: argparse.Namespace) -> list[str]:
+    """Return the hidden --cold-boot-guidance option of nvx-rs run, which
+    holds the guidance that nvx-rs prints after OpenVMM fails a cold boot on a
+    host whose CPU no built-in CPU profile serves, or nothing.
 
-
-def _extend_network_arguments(
-    command: list[str],
-    args: argparse.Namespace,
-    network_egress_allow: tuple[str, ...],
-    network_egress_deny: tuple[str, ...],
-) -> None:
-    if args.net is not None:
-        command.extend(["--net", args.net, "--network-profile", args.network_profile])
-    if args.network_egress is not None:
-        command.extend(["--network-egress", args.network_egress])
-    if args.network_ingress is not None:
-        command.extend(["--network-ingress", args.network_ingress])
-    for rule in network_egress_allow:
-        command.extend(["--network-egress-allow", rule])
-    for rule in network_egress_deny:
-        command.extend(["--network-egress-deny", rule])
-    if args.host_loopback is not None:
-        command.extend(["--host-loopback", args.host_loopback])
-    if args.network_proxy is not None:
-        command.extend(["--network-proxy", args.network_proxy])
-    for forward in args.host_loopback_forward:
-        command.extend(["--host-loopback-forward", forward])
-
-
-def command_run(args: argparse.Namespace) -> None:
-    if (args.net is None) != (args.network_profile is None):
-        raise ScriptError("--net and --network-profile must be specified together")
-    if args.restore_ready_path is not None and args.restore_snapshot is None:
-        raise ScriptError("--restore-ready-path requires --restore-snapshot")
-    if args.restore_processors is not None and args.restore_snapshot is None:
-        raise ScriptError("--restore-processors requires --restore-snapshot")
-    if args.restore_memory_mib is not None and args.restore_snapshot is None:
-        raise ScriptError("--restore-memory-mib requires --restore-snapshot")
-    if args.memory_capacity_mib is not None and args.restore_snapshot is not None:
-        raise ScriptError("--memory-capacity-mib is only valid for a fresh boot")
-    descriptor = guest_descriptor(args.guest)
-    if args.restore_snapshot is not None and descriptor.name != "alpine":
-        raise ScriptError(
-            "--guest is not accepted for restore; the snapshot already fixes the guest"
-        )
-    memory_mib = (
-        descriptor.default_memory_mib if args.memory_mib is None else args.memory_mib
+    The CPU catalog of the guidance stays in time_abi.py, which doctor and
+    benchmark use too. A dry run and a restore never boot the guest, and only
+    a guidance that applies needs the OpenVMM executable, which the guidance's
+    command names, so nvx.py looks it up only then."""
+    if getattr(args, "dry_run", False) or hasattr(args, "restore_snapshot"):
+        return []
+    cpu_profile = cast(str | None, getattr(args, "cpu_profile", None))
+    host = host_cpu_signature()
+    if not cpu_profile_guidance_applies(cpu_profile, host):
+        return []
+    guidance = host_cpu_profile_guidance(
+        cpu_profile,
+        host,
+        _format_command([os.fspath(nvx_rs.artifacts().openvmm)]),
+        _hypervisor(cast(str, getattr(args, "hypervisor", "auto"))),
     )
-    if args.memory_capacity_mib is not None and args.memory_capacity_mib < memory_mib:
-        raise ScriptError("--memory-capacity-mib cannot be below --memory-mib")
-    if args.restore_processors is not None:
-        if args.restore_processors > args.processors:
-            raise ScriptError(
-                "--restore-processors cannot exceed --processors capacity"
-            )
-    network_egress_allow, network_egress_deny = _resolve_network_egress_rules(args)
-    artifacts = nvx_rs.artifacts()
-    executable = require_file(artifacts.openvmm, "OpenVMM release binary")
-    command = [
-        str(executable),
-        "--single-process",
-        "--machine",
-        args.machine,
-        "--processors",
-        str(args.processors),
-        "--hypervisor",
-        _hypervisor(args.hypervisor),
-    ]
-    if args.restore_snapshot is not None:
-        command.extend(["--restore-snapshot", str(args.restore_snapshot)])
-        if args.restore_processors is not None:
-            command.extend(["--restore-processors", str(args.restore_processors)])
-        if args.restore_memory_mib is not None:
-            command.extend(["--restore-memory", f"{args.restore_memory_mib}M"])
-        if args.restore_ready_path is not None:
-            command.extend(["--restore-ready-path", str(args.restore_ready_path)])
-    else:
-        kernel = require_file(artifacts.kernel, "Linux direct kernel")
-        guest = artifacts.guest(descriptor.name)
-        initrd = require_file(guest.initramfs, f"{guest.distribution} initramfs")
-        command.extend(
-            [
-                "--memory",
-                f"{memory_mib}M",
-                "--kernel",
-                str(kernel),
-                "--initrd",
-                str(initrd),
-            ]
-        )
-        if args.memory_capacity_mib is not None:
-            command.extend(["--memory-capacity", f"{args.memory_capacity_mib}M"])
-    if args.cpu_profile is not None:
-        command.extend(["--cpu-profile", args.cpu_profile])
-    shares = [parse_mount_value(value) for value in args.mount]
-    # A file is shared as the child of an aggregate, even alone, because the
-    # guest mounts the device's root, which is a directory.
-    kinds = [mount_kind(Path(host_path)) for _, host_path, _ in shares]
-    aggregate = len(shares) > 1 or "file" in kinds
-    if shares and not aggregate:
-        command.extend(["--mount", mount_argument(*shares[0])])
-    elif shares:
-        _validate_run_share_targets([target for target, _, _ in shares])
-        command.extend(["--mount-aggregate", AGGREGATE_MOUNT_TARGET])
-        # A restore names the children as the boot did, so OpenVMM refuses a
-        # restore whose targets differ from those that the guest bound.
-        for index, (target, host_path, access) in enumerate(shares):
-            name = aggregate_child_name(index, target)
-            command.extend(
-                [
-                    "--mount-child",
-                    aggregate_child_argument(name, host_path, access, kinds[index]),
-                ]
-            )
-    if args.mount_owner is not None and not args.mount:
-        raise ScriptError("--mount-owner requires --mount")
-    for option in MOUNT_POLICY_OPTIONS.values():
-        for path in getattr(args, _mount_policy_destination(option)):
-            # OpenVMM attributes each path of an aggregate to the child whose
-            # host directory contains it.
-            if aggregate and not Path(path).is_absolute():
-                raise ScriptError(
-                    f"with several --mount shares, or a shared file, {option} "
-                    f"{path} must be an absolute host path"
-                )
-            command.extend([option, str(path)])
-    if args.mount_owner is not None:
-        require_mount_owner_supported(args.mount_owner)
-        command.extend(["--mount-owner", args.mount_owner])
-    _extend_network_arguments(
-        command,
-        args,
-        network_egress_allow,
-        network_egress_deny,
+    return [] if guidance is None else [f"--cold-boot-guidance={guidance}"]
+
+
+def command_run(args: argparse.Namespace) -> int:
+    """Run the run command with nvx-rs, which checks its options, builds the
+    OpenVMM command line, and runs OpenVMM on the standard streams, and return
+    the status that nvx.py exits with."""
+    return nvx_rs.run(
+        ["run", *getattr(args, NVX_RS_ARGUMENTS), *_cold_boot_guidance(args)],
+        program=args.program,
     )
-    if args.outcome_report is not None:
-        command.extend(["--microvm-report", str(args.outcome_report)])
-    cmdline = args.cmdline
-    # A restored guest keeps the binds that its boot made, at the targets that
-    # its children's names pin.
-    if aggregate and args.restore_snapshot is None:
-        cmdline = " ".join(
-            token
-            for token in (
-                args.cmdline,
-                *aggregate_share_tokens(
-                    [
-                        (target, access, kind)
-                        for (target, _, access), kind in zip(shares, kinds, strict=True)
-                    ]
-                ),
-            )
-            if token
-        )
-        fragment = aggregate_command_line_fragment([access for _, _, access in shares])
-        if len(cmdline.encode()) + len(fragment.encode()) + 1 > (
-            SANDBOX_COMMAND_LINE_MAX_SIZE
-        ):
-            raise ScriptError(
-                "the --mount shares and --cmdline exceed the 1024-byte budget of "
-                "the kernel command line; attach fewer shares or use shorter targets"
-            )
-    if cmdline:
-        command.extend(["--cmdline", cmdline])
-    print(f">> {_format_command(command)}")
-    if not args.dry_run:
-        raise SystemExit(
-            _run_openvmm(
-                command,
-                args.cpu_profile,
-                args.restore_snapshot is None,
-                _hypervisor(args.hypervisor),
-            )
-        )
-
-
-def _run_openvmm(
-    command: list[str], cpu_profile: str | None, cold_boot: bool, hypervisor: str
-) -> int:
-    """Run OpenVMM on the terminal, and explain the next steps when a cold boot
-    fails on a host whose CPU no built-in CPU profile serves, with the
-    ``hypervisor`` backend.
-
-    OpenVMM keeps all three standard streams: it restores the terminal settings
-    that its console changes only when its standard error is a terminal, and
-    writes its log for a terminal there."""
-    returncode = subprocess.run(command).returncode
-    if returncode != 0 and cold_boot:
-        guidance = host_cpu_profile_guidance(
-            cpu_profile, host_cpu_signature(), _format_command(command[:1]), hypervisor
-        )
-        if guidance is not None:
-            print(guidance, file=sys.stderr)
-    return returncode
 
 
 def command_sandbox(args: argparse.Namespace) -> int:
     """Run the sandbox command with nvx-rs, which checks its options and runs it
     on the standard streams, and return the status that nvx.py exits with."""
     return nvx_rs.run(
-        ["sandbox", args.sandbox_operation, *getattr(args, SANDBOX_ARGUMENTS)],
+        ["sandbox", args.sandbox_operation, *getattr(args, NVX_RS_ARGUMENTS)],
         program=args.program,
     )
 
@@ -986,16 +770,21 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     download.set_defaults(handler=command_download)
 
     run = subparsers.add_parser("run", help="run an OpenVMM microVM")
-    run.add_argument("--guest", choices=GUEST_NAMES, default="alpine")
-    run.add_argument("--hypervisor", choices=HYPERVISORS, default="auto")
-    run.add_argument(
-        "--machine",
-        choices=("microvm",),
-        default="microvm",
-    )
-    run.add_argument(
+
+    # nvx-rs checks the values and applies the defaults; these options define
+    # the command line and its help, and argparse checks only the choices of
+    # those that take a string. nvx.py keeps the options that decide on its
+    # CPU-profile guidance.
+    def run_option(*names: str, flag: bool = False, **kwargs: Any) -> None:
+        run.add_argument(
+            *names, action=_NvxRsOption, nargs=0 if flag else None, **kwargs
+        )
+
+    run_option("--guest", choices=GUEST_NAMES)
+    run_option("--hypervisor", choices=HYPERVISORS, keep=True)
+    run_option("--machine", choices=("microvm",))
+    run_option(
         "--memory-mib",
-        type=int,
         help=(
             "guest RAM in MiB (default by --guest: "
             + ", ".join(
@@ -1005,10 +794,13 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
             + ")"
         ),
     )
-    run.add_argument("--memory-capacity-mib", type=int)
-    run.add_argument("--processors", type=int, choices=(1, 2, 4, 8), default=1)
-    run.add_argument(
+    run_option("--memory-capacity-mib")
+    # nvx-rs converts the processor counts before it checks their choices, as
+    # argparse checks those of an option of type int.
+    run_option("--processors", metavar="{1,2,4,8}")
+    run_option(
         "--cpu-profile",
+        keep=True,
         metavar="ID",
         help=(
             "OpenVMM CPU profile: auto (OpenVMM's default) for the built-in "
@@ -1016,10 +808,8 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
             "derive a development profile from this host (doc/usage.md)"
         ),
     )
-    run.add_argument(
+    run_option(
         "--mount",
-        action="append",
-        default=[],
         metavar="GUEST_TARGET,HOST_PATH[,ro|rw]",
         help=(
             "live-share a host directory, or a single regular host file without "
@@ -1029,27 +819,21 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
             "virtio-fs device"
         ),
     )
-    run.add_argument("--mount-deny", action="append", type=Path, default=[])
-    run.add_argument(
+    run_option("--mount-deny")
+    run_option(
         "--mount-allow",
-        action="append",
-        type=Path,
-        default=[],
         metavar="HOST_PATH",
         help="expose one existing path inside a --mount-deny path again",
     )
-    run.add_argument(
+    run_option(
         "--mount-write",
-        action="append",
-        type=Path,
-        default=[],
         metavar="HOST_PATH",
         help=(
             "make one existing path one of the only writable parts of a "
             "read-write --mount"
         ),
     )
-    run.add_argument(
+    run_option(
         "--mount-owner",
         choices=MOUNT_OWNERS,
         help=(
@@ -1058,45 +842,36 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
             "directory or file (Linux only)"
         ),
     )
-    run.add_argument("--net", metavar="IPV4/PREFIX")
-    run.add_argument("--network-profile", choices=NETWORK_PROFILES)
-    run.add_argument("--network-egress", choices=("allow", "deny"))
-    run.add_argument("--network-ingress", choices=("allow", "deny"))
-    run.add_argument(
+    run_option("--net", metavar="IPV4/PREFIX")
+    run_option("--network-profile", choices=NETWORK_PROFILES)
+    run_option("--network-egress", choices=("allow", "deny"))
+    run_option("--network-ingress", choices=("allow", "deny"))
+    run_option(
         "--network-egress-allow",
-        action="append",
-        default=[],
         metavar=NETWORK_EGRESS_RULE_METAVAR,
         help=NETWORK_EGRESS_RULE_HELP.format(action="allow"),
     )
-    run.add_argument(
+    run_option(
         "--network-egress-deny",
-        action="append",
-        default=[],
         metavar=NETWORK_EGRESS_RULE_METAVAR,
         help=NETWORK_EGRESS_RULE_HELP.format(action="deny"),
     )
-    run.add_argument(
+    run_option(
         "--network-egress-policy-file",
-        type=Path,
         metavar="PATH",
         help="load bounded MXC-shaped IPv4 and IPv6 egress rules from JSON",
     )
-    run.add_argument("--host-loopback", choices=("allow", "deny"))
-    run.add_argument("--network-proxy", metavar="IPV4:TCP-PORT")
-    run.add_argument("--host-loopback-forward", action="append", default=[])
-    run.add_argument(
-        "--outcome-report",
-        type=Path,
-        help="write a bounded local JSON outcome report",
-    )
-    run.add_argument("--cmdline", default="")
-    run.add_argument("--restore-snapshot", type=Path)
-    run.add_argument("--restore-processors", type=int, choices=(1, 2, 4, 8))
-    run.add_argument("--restore-memory-mib", type=int)
-    run.add_argument("--restore-ready-path", type=Path)
-    run.add_argument("--dry-run", action="store_true")
-    run.set_defaults(handler=command_run)
+    run_option("--host-loopback", choices=("allow", "deny"))
+    run_option("--network-proxy", metavar="IPV4:TCP-PORT")
+    run_option("--host-loopback-forward")
+    run_option("--outcome-report", help="write a bounded local JSON outcome report")
+    run_option("--cmdline")
+    run_option("--restore-snapshot", keep=True)
+    run_option("--restore-processors", metavar="{1,2,4,8}")
+    run_option("--restore-memory-mib")
+    run_option("--restore-ready-path")
+    run_option("--dry-run", flag=True, keep=True)
+    run.set_defaults(handler=command_run, program=parser.prog, **{NVX_RS_ARGUMENTS: []})
 
     sandbox = subparsers.add_parser(
         "sandbox",
@@ -1107,7 +882,7 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     # the command line and its help.
     def sandbox_option(*names: str, flag: bool = False, **kwargs: Any) -> None:
         sandbox.add_argument(
-            *names, action=_SandboxOption, nargs=0 if flag else None, **kwargs
+            *names, action=_NvxRsOption, nargs=0 if flag else None, **kwargs
         )
 
     sandbox.add_argument(
@@ -1244,7 +1019,7 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
         help="print the one-shot run command without launching it",
     )
     sandbox.set_defaults(
-        handler=command_sandbox, program=parser.prog, **{SANDBOX_ARGUMENTS: []}
+        handler=command_sandbox, program=parser.prog, **{NVX_RS_ARGUMENTS: []}
     )
 
     benchmark = subparsers.add_parser(

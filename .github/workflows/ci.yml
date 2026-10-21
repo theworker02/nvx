@@ -126,12 +126,11 @@ jobs:
         with:
           python-version: "3.12"
 
-      # nvx.py runs nvx-rs for its sandbox command and for the egress and
-      # artifact steps of its run command. A static musl build runs on every
-      # self-hosted Linux runner, so the microVM jobs take this one, as they
-      # take OpenVMM from its build jobs. It goes where `cargo build
-      # --release` puts it, where nvx.py, and so the CLI tests, look for it,
-      # and NVX_RS names it for the tests that run it directly.
+      # nvx.py runs nvx-rs for its run and sandbox commands. A static musl
+      # build runs on every self-hosted Linux runner, so the microVM jobs take
+      # this one, as they take OpenVMM from its build jobs. It goes where
+      # `cargo build --release` puts it, where nvx.py, and so the CLI tests,
+      # look for it, and NVX_RS names it for the tests that run it directly.
       - name: Build nvx-rs
         shell: bash
         run: |

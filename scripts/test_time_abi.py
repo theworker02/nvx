@@ -517,6 +517,16 @@ class FieldParsingTests(unittest.TestCase):
         ):
             with self.subTest(cpu_profile=cpu_profile, host=host):
                 self.assertIsNone(guide(cpu_profile, host))
+        # The guidance applies exactly where there is one, which a caller can
+        # tell before it looks up the OpenVMM executable that the guidance
+        # names.
+        for cpu_profile in (None, "auto", "host", "intel.alderlake.v1"):
+            for host in (tiger_lake, raphael, hygon, alder_lake, milan, None):
+                with self.subTest(cpu_profile=cpu_profile, host=host):
+                    self.assertEqual(
+                        time_abi.cpu_profile_guidance_applies(cpu_profile, host),
+                        guide(cpu_profile, host) is not None,
+                    )
 
     def test_names_cpus_and_prefills_cpu_profile_requests(self):
         granite_rapids = time_abi.HostCpu(

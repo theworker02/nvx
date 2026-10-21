@@ -55,7 +55,6 @@ from nvx_tools import (  # noqa: E402
     guests,
     nvx_rs,
     release,
-    sandbox,
     ubuntu,
 )
 from nvx_tools.build_constants import (  # noqa: E402
@@ -78,6 +77,7 @@ from nvx_tools.time_abi import (  # noqa: E402
     CpuModel,
     HostCpu,
     cpu_profile_request_url,
+    host_cpu_profile_guidance,
 )
 
 
@@ -496,34 +496,7 @@ def _write_release_fixture(
     return paths, kernel_inputs, revision
 
 
-def _checkout_artifacts() -> nvx_rs.ArtifactPaths:
-    """Return the artifact paths of this checkout as `nvx-rs artifacts` prints
-    them, for tests of `nvx.py run` that need no nvx-rs."""
-    return nvx_rs.ArtifactPaths(
-        openvmm=common.openvmm_binary_path(),
-        kernel=common.artifact_path(KernelBuildConstants.BINARY_NAME),
-        guests=tuple(
-            nvx_rs.GuestArtifacts(
-                name,
-                guests.guest_descriptor(name).distribution,
-                common.artifact_path(guests.guest_descriptor(name).initramfs_name),
-            )
-            for name in guests.GUEST_NAMES
-        ),
-    )
-
-
-class _CheckoutArtifacts(unittest.TestCase):
-    """Answers the artifact lookups of `nvx.py run` without nvx-rs."""
-
-    def setUp(self) -> None:
-        super().setUp()
-        patcher = patch.object(nvx_rs, "artifacts", side_effect=_checkout_artifacts)
-        self.artifacts = patcher.start()
-        self.addCleanup(patcher.stop)
-
-
-class CliTests(_CheckoutArtifacts):
+class CliTests(unittest.TestCase):
     def test_usage_documents_every_command_and_option(self):
         # doc/usage.md is the CLI reference: every command has a row in its
         # command table and a section that names exactly the options of the
@@ -675,6 +648,53 @@ class CliTests(_CheckoutArtifacts):
             with self.subTest(guest=name):
                 self.assertIn(f"{name} {default}", help_text)
                 self.assertIn(f"{default} for {labels[name]}", row)
+
+    def test_run_help_and_memory_defaults_are_those_that_nvx_rs_replays(self):
+        # nvx.py run runs nvx-rs run, whose golden scenarios replay the help
+        # and the dry runs that nvx.py run recorded, so they pin its help and
+        # the default memory of each guest, which guests.py also gives
+        # test-microvm, to those of nvx-rs.
+        fixture = json.loads(
+            (nvx_rs.DIRECTORY / "tests" / "fixtures" / "cli.json").read_text(
+                encoding="utf-8"
+            )
+        )
+        section = "windows" if os.name == "nt" else "posix"
+        scenarios = {
+            cast(str, scenario["name"]): cast(
+                list[dict[str, object]], scenario["steps"]
+            )[0]
+            for scenario in cast(list[dict[str, object]], fixture[section])
+        }
+
+        def recorded(name: str) -> str:
+            stdout = cast(str, scenarios[f"run, {name}"]["stdout"])
+            return stdout.replace("\r\n", "\n")
+
+        stdout = io.StringIO()
+        with (
+            patch.dict(os.environ, {"COLUMNS": "80", "NO_COLOR": "1"}),
+            patch.object(sys, "argv", ["nvx.py"]),
+            contextlib.redirect_stdout(stdout),
+            self.assertRaises(SystemExit),
+        ):
+            nvx.parse_args(["run", "--help"])
+        expected = recorded("usage: help").replace("nvx-rs run", "nvx.py run", 1)
+        if sys.version_info >= (3, 14):
+            self.assertEqual(stdout.getvalue(), expected)
+        else:
+            # Older releases of argparse wrap some of the help differently.
+            self.assertEqual(stdout.getvalue().split(), expected.split())
+        labels = {
+            "alpine": "Alpine",
+            "ubuntu": "Ubuntu",
+            "azurelinux": "Azure Linux",
+        }
+        for name in guests.GUEST_NAMES:
+            default = guests.guest_descriptor(name).default_memory_mib
+            with self.subTest(guest=name):
+                command = recorded(f"dry run: {labels[name]} default")
+                self.assertIn(f" --memory {default}M ", command)
 
     def test_benchmark_exposes_device_restore_profile(self):
         args = nvx.parse_args(
@@ -959,589 +979,6 @@ class CliTests(_CheckoutArtifacts):
             ):
                 build.build_docker_artifacts(config, "azurelinux")
 
-    def test_ubuntu_run_selects_artifact_and_default_memory(self):
-        args = nvx.parse_args(["run", "--guest", "ubuntu", "--dry-run"])
-
-        def require(path: Path, _description: str) -> Path:
-            return path
-
-        with (
-            patch.object(nvx, "require_file", side_effect=require),
-            patch.object(
-                nvx,
-                "_format_command",
-                return_value="formatted",
-            ) as format_command,
-        ):
-            nvx.command_run(args)
-
-        command = format_command.call_args.args[0]
-        self.assertEqual(command[command.index("--memory") + 1], "512M")
-        self.assertEqual(
-            Path(command[command.index("--initrd") + 1]).name,
-            "initramfs-ubuntu.cpio.gz",
-        )
-
-    def test_azurelinux_run_selects_artifact_and_default_memory(self):
-        args = nvx.parse_args(["run", "--guest", "azurelinux", "--dry-run"])
-
-        def require(path: Path, _description: str) -> Path:
-            return path
-
-        with (
-            patch.object(nvx, "require_file", side_effect=require),
-            patch.object(
-                nvx,
-                "_format_command",
-                return_value="formatted",
-            ) as format_command,
-        ):
-            nvx.command_run(args)
-
-        command = format_command.call_args.args[0]
-        self.assertEqual(command[command.index("--memory") + 1], "512M")
-        self.assertEqual(
-            Path(command[command.index("--initrd") + 1]).name,
-            "initramfs-azurelinux.cpio.gz",
-        )
-
-    def test_restore_rejects_ubuntu_guest_selection(self):
-        args = nvx.parse_args(
-            [
-                "run",
-                "--guest",
-                "ubuntu",
-                "--restore-snapshot",
-                "snapshot",
-                "--dry-run",
-            ]
-        )
-        with self.assertRaisesRegex(common.ScriptError, "snapshot already fixes"):
-            nvx.command_run(args)
-
-    def test_network_requires_explicit_portable_profile(self):
-        args = nvx.parse_args(
-            [
-                "run",
-                "--net",
-                "10.0.0.2/24",
-                "--network-profile",
-                "portable",
-            ]
-        )
-        self.assertEqual(args.network_profile, "portable")
-
-        missing_profile = nvx.parse_args(["run", "--net", "10.0.0.2/24"])
-        with self.assertRaisesRegex(common.ScriptError, "--net and --network-profile"):
-            nvx.command_run(missing_profile)
-
-        missing_network = nvx.parse_args(["run", "--network-profile", "portable"])
-        with self.assertRaisesRegex(common.ScriptError, "--net and --network-profile"):
-            nvx.command_run(missing_network)
-
-    def test_run_forwards_network_arguments(self):
-        network_arguments = (
-            "--net 10.0.0.2/24 --network-profile portable "
-            "--network-egress deny --network-ingress deny "
-            "--network-egress-allow 140.82.112.0/20:tcp:443 "
-            "--network-egress-deny 10.0.0.0/8 --host-loopback allow "
-            "--network-proxy 10.0.0.1:3128 --host-loopback-forward tcp:8080:80"
-        ).split()
-
-        def require(path: Path, _description: str) -> Path:
-            return path
-
-        args = nvx.parse_args(["run", "--dry-run", *network_arguments])
-        with (
-            patch.object(nvx, "require_file", side_effect=require),
-            patch.object(
-                nvx, "_format_command", return_value="formatted"
-            ) as format_command,
-        ):
-            args.handler(args)
-
-        command = format_command.call_args.args[0]
-        self.assertEqual(command[command.index("--net") :], network_arguments)
-
-    def test_run_lowers_structured_egress_policy_before_launch(self):
-        args = nvx.parse_args(
-            [
-                "run",
-                "--dry-run",
-                "--network-egress",
-                "deny",
-                "--network-egress-policy-file",
-                "policy.json",
-            ]
-        )
-
-        def require(path: Path, _description: str) -> Path:
-            return path
-
-        rules = nvx_rs.EgressRules(
-            allow=("192.0.2.0/25:tcp:8000-8001", "192.0.2.200/32"),
-            deny=("192.0.2.0/24:tcp:8001",),
-        )
-        with (
-            patch.object(
-                nvx_rs, "compile_egress_policy", return_value=rules
-            ) as compile_policy,
-            patch.object(nvx, "require_file", side_effect=require),
-            patch.object(
-                nvx, "_format_command", return_value="formatted"
-            ) as format_command,
-        ):
-            nvx.command_run(args)
-
-        compile_policy.assert_called_once_with(Path("policy.json"))
-        command = format_command.call_args.args[0]
-        self.assertNotIn("--network-egress-policy-file", command)
-        self.assertEqual(
-            command[command.index("--network-egress") :],
-            [
-                "--network-egress",
-                "deny",
-                "--network-egress-allow",
-                "192.0.2.0/25:tcp:8000-8001",
-                "--network-egress-allow",
-                "192.0.2.200/32",
-                "--network-egress-deny",
-                "192.0.2.0/24:tcp:8001",
-            ],
-        )
-
-    @unittest.skipUnless(
-        os.environ.get("NVX_RS"), "set NVX_RS to an nvx-rs executable to run"
-    )
-    def test_run_lowers_structured_egress_policy_with_nvx_rs(self):
-        with tempfile.TemporaryDirectory() as temporary:
-            policy = Path(temporary) / "policy.json"
-            policy.write_text(
-                json.dumps(
-                    {
-                        "allow": [
-                            {
-                                "to": [
-                                    {
-                                        "cidr": "192.0.2.0/24",
-                                        "except": ["192.0.2.128/25"],
-                                    }
-                                ],
-                                "ports": [
-                                    {
-                                        "protocol": "tcp",
-                                        "port": 8000,
-                                        "endPort": 8001,
-                                    }
-                                ],
-                            },
-                            {"to": [{"cidr": "192.0.2.200/32"}]},
-                        ],
-                        "deny": [
-                            {
-                                "to": [{"cidr": "192.0.2.0/24"}],
-                                "ports": [{"protocol": "tcp", "port": 8001}],
-                            }
-                        ],
-                    }
-                ),
-                encoding="utf-8",
-            )
-            args = nvx.parse_args(
-                [
-                    "run",
-                    "--dry-run",
-                    "--network-egress",
-                    "deny",
-                    "--network-egress-policy-file",
-                    str(policy),
-                ]
-            )
-
-            def require(path: Path, _description: str) -> Path:
-                return path
-
-            with (
-                patch.object(nvx, "require_file", side_effect=require),
-                patch.object(
-                    nvx, "_format_command", return_value="formatted"
-                ) as format_command,
-            ):
-                nvx.command_run(args)
-            command = format_command.call_args.args[0]
-            self.assertEqual(
-                command[command.index("--network-egress-allow") :],
-                [
-                    "--network-egress-allow",
-                    "192.0.2.0/25:tcp:8000-8001",
-                    "--network-egress-allow",
-                    "192.0.2.200/32",
-                    "--network-egress-deny",
-                    "192.0.2.0/24:tcp:8001",
-                ],
-            )
-            # A refused policy fails with the compiler's message, before the
-            # artifacts are looked up.
-            policy.write_text(
-                json.dumps({"allow": [{"to": [{"cidr": "fe80::1%eth0/64"}]}]}),
-                encoding="utf-8",
-            )
-            self.artifacts.reset_mock()
-            with self.assertRaisesRegex(
-                common.ScriptError,
-                r"^allow\[0\]\.to\[0\]\.cidr must not name an IPv6 scope: "
-                r"fe80::1%eth0/64$",
-            ):
-                nvx.command_run(args)
-            self.artifacts.assert_not_called()
-
-    def test_policy_file_rejects_ambiguous_flags_before_artifact_access(self):
-        cases = (
-            [
-                "--network-egress",
-                "deny",
-                "--network-egress-policy-file",
-                "policy.json",
-                "--network-egress-allow",
-                "192.0.2.1",
-            ],
-            ["--network-egress-policy-file", "policy.json"],
-        )
-        for extra in cases:
-            with self.subTest(extra=extra):
-                args = nvx.parse_args(["run", "--dry-run", *extra])
-                with (
-                    patch.object(nvx, "require_file") as require,
-                    self.assertRaises(common.ScriptError),
-                ):
-                    nvx.command_run(args)
-                require.assert_not_called()
-
-    def test_run_reports_policy_errors_before_looking_up_artifacts(self):
-        args = nvx.parse_args(
-            [
-                "run",
-                "--dry-run",
-                "--network-egress",
-                "deny",
-                "--network-egress-policy-file",
-                "policy.json",
-            ]
-        )
-        with (
-            patch.object(
-                nvx_rs,
-                "compile_egress_policy",
-                side_effect=common.ScriptError("egress policy must be an object"),
-            ),
-            patch.object(nvx, "require_file") as require,
-            self.assertRaisesRegex(
-                common.ScriptError, "^egress policy must be an object$"
-            ),
-        ):
-            nvx.command_run(args)
-        self.artifacts.assert_not_called()
-        require.assert_not_called()
-
-    def test_run_takes_its_artifacts_from_nvx_rs(self):
-        root = Path("alternate")
-        artifacts = nvx_rs.ArtifactPaths(
-            openvmm=root / "openvmm",
-            kernel=root / "vmlinux",
-            guests=(
-                nvx_rs.GuestArtifacts("alpine", "Alpine Linux", root / "alpine.gz"),
-                nvx_rs.GuestArtifacts("ubuntu", "Ubuntu Base", root / "ubuntu.gz"),
-            ),
-        )
-        self.artifacts.side_effect = None
-        self.artifacts.return_value = artifacts
-
-        def require(path: Path, _description: str) -> Path:
-            return path
-
-        args = nvx.parse_args(["run", "--guest", "ubuntu", "--dry-run"])
-        with (
-            patch.object(nvx, "require_file", side_effect=require) as require_file,
-            patch.object(
-                nvx, "_format_command", return_value="formatted"
-            ) as format_command,
-        ):
-            nvx.command_run(args)
-        command = format_command.call_args.args[0]
-        self.assertEqual(command[0], str(root / "openvmm"))
-        self.assertEqual(command[command.index("--kernel") + 1], str(root / "vmlinux"))
-        self.assertEqual(
-            command[command.index("--initrd") + 1], str(root / "ubuntu.gz")
-        )
-        # The checks and their messages are those of nvx.py.
-        self.assertEqual(
-            require_file.call_args_list,
-            [
-                call(root / "openvmm", "OpenVMM release binary"),
-                call(root / "vmlinux", "Linux direct kernel"),
-                call(root / "ubuntu.gz", "Ubuntu Base initramfs"),
-            ],
-        )
-        with self.assertRaisesRegex(
-            common.ScriptError,
-            "^OpenVMM release binary not found: " + re.escape(str(root / "openvmm")),
-        ):
-            nvx.command_run(args)
-
-    def test_run_parses_denied_filesystem_paths(self):
-        args = nvx.parse_args(
-            [
-                "run",
-                "--mount",
-                "/mnt/share,share,rw",
-                "--mount-deny",
-                "share/secrets",
-                "--mount-deny",
-                "share/private",
-            ]
-        )
-        self.assertEqual(
-            args.mount_deny,
-            [Path("share/secrets"), Path("share/private")],
-        )
-
-    def test_run_forwards_the_share_access_policy(self):
-        args = nvx.parse_args(
-            [
-                "run",
-                "--mount",
-                "/mnt/share,share,rw",
-                "--mount-write",
-                "share/out",
-                "--mount-allow",
-                "share/logs/payloads",
-                "--mount-deny",
-                "share/logs",
-                "--dry-run",
-            ]
-        )
-        with (
-            patch.object(nvx, "require_file", return_value=Path("artifact")),
-            patch.object(
-                nvx, "_format_command", return_value="formatted"
-            ) as format_command,
-        ):
-            nvx.command_run(args)
-
-        command = format_command.call_args.args[0]
-        self.assertEqual(
-            [
-                (value, command[index + 1])
-                for index, value in enumerate(command)
-                if value.startswith("--mount-")
-            ],
-            [
-                ("--mount-deny", str(Path("share/logs"))),
-                ("--mount-allow", str(Path("share/logs/payloads"))),
-                ("--mount-write", str(Path("share/out"))),
-            ],
-        )
-
-    def test_run_forwards_mount_owner_and_requires_mount(self):
-        args = nvx.parse_args(
-            ["run", "--mount", "/mnt/share,share,rw", "--mount-owner", "caller"]
-            + ["--dry-run"]
-        )
-        with (
-            patch.object(nvx, "require_file", return_value=Path("artifact")),
-            patch.object(
-                nvx, "_format_command", return_value="formatted"
-            ) as format_command,
-        ):
-            if sys.platform == "win32":
-                with self.assertRaisesRegex(common.ScriptError, "Linux host"):
-                    nvx.command_run(args)
-                format_command.assert_not_called()
-            else:
-                nvx.command_run(args)
-                command = format_command.call_args.args[0]
-                self.assertEqual(command[command.index("--mount-owner") + 1], "caller")
-
-            default = nvx.parse_args(["run", "--mount", "/mnt/share,share,rw"])
-            self.assertIsNone(default.mount_owner)
-            unmounted = nvx.parse_args(["run", "--mount-owner", "vmm", "--dry-run"])
-            with self.assertRaisesRegex(common.ScriptError, "requires --mount"):
-                nvx.command_run(unmounted)
-        with self.assertRaises(SystemExit), contextlib.redirect_stderr(io.StringIO()):
-            nvx.parse_args(
-                ["run", "--mount", "/mnt/share,share", "--mount-owner", "root"]
-            )
-
-    def test_run_forwards_bounded_outcome_report(self):
-        args = nvx.parse_args(["run", "--outcome-report", "outcome.json", "--dry-run"])
-        with (
-            patch.object(nvx, "require_file", return_value=Path("artifact")),
-            patch.object(
-                nvx, "_format_command", return_value="formatted"
-            ) as format_command,
-        ):
-            nvx.command_run(args)
-
-        command = format_command.call_args.args[0]
-        self.assertEqual(
-            command[command.index("--microvm-report") + 1],
-            "outcome.json",
-        )
-
-    def test_run_forwards_the_cpu_profile(self):
-        def launched(*extra: str) -> list[str]:
-            args = nvx.parse_args(["run", *extra, "--dry-run"])
-            with (
-                patch.object(nvx, "require_file", return_value=Path("artifact")),
-                patch.object(
-                    nvx, "_format_command", return_value="formatted"
-                ) as format_command,
-            ):
-                nvx.command_run(args)
-            return format_command.call_args.args[0]
-
-        # Without the option, OpenVMM selects auto itself.
-        self.assertNotIn("--cpu-profile", launched())
-        for profile in ("host", "auto", "intel.alderlake.v1"):
-            command = launched("--cpu-profile", profile)
-            self.assertEqual(command[command.index("--cpu-profile") + 1], profile)
-        restored = launched("--restore-snapshot", "snapshot", "--cpu-profile", "host")
-        self.assertEqual(restored[restored.index("--cpu-profile") + 1], "host")
-
-    def test_run_explains_a_host_cpu_that_no_profile_serves(self):
-        tiger_lake = HostCpu("GenuineIntel", 6, 140, 1, "Intel(R) Core(TM) i7-1185G7")
-        zen3 = HostCpu("AuthenticAMD", 25, 33, 0)
-        openvmm = "/nvx/openvmm/target/release/openvmm"
-
-        def run(
-            returncode: int,
-            cpu_profile: str | None,
-            cold_boot: bool = True,
-            host: HostCpu | None = tiger_lake,
-        ) -> tuple[int, str]:
-            stderr = io.StringIO()
-            completed = subprocess.CompletedProcess[bytes]([openvmm], returncode)
-            with (
-                patch.object(nvx.sys, "stderr", stderr),
-                patch.object(nvx.subprocess, "run", return_value=completed) as launch,
-                patch.object(nvx, "host_cpu_signature", return_value=host),
-            ):
-                status = nvx._run_openvmm(  # pyright: ignore[reportPrivateUsage]
-                    [openvmm, "--hypervisor", "kvm"], cpu_profile, cold_boot, "kvm"
-                )
-            # OpenVMM keeps the terminal, its standard error included.
-            launch.assert_called_once_with([openvmm, "--hypervisor", "kvm"])
-            return status, stderr.getvalue()
-
-        status, output = run(1, None)
-        self.assertEqual(status, 1)
-        # auto falls back on the CPU, so run says so, and asks for the CPU's
-        # fingerprint, which this OpenVMM writes for this backend, through the
-        # CPU profile request form.
-        self.assertIn(
-            "nvx: no built-in CPU profile serves this host's CPU, "
-            "GenuineIntel 6/140/1 (Intel(R) Core(TM) i7-1185G7), so --cpu-profile "
-            "auto, the default, falls back on it to a CPU profile derived from "
-            "this host",
-            output,
-        )
-        self.assertIn("alderlake 6/151 and 6/154", output)
-        self.assertIn(
-            f"nvx:   {openvmm} --hypervisor kvm --cpu-fingerprint fingerprint.json\n",
-            output,
-        )
-        self.assertIn(cpu_profile_request_url(tiger_lake), output)
-        self.assertIn("https://github.com/microsoft/nvx/issues/408", output)
-        self.assertNotIn("rerun with --cpu-profile host", output)
-        self.assertEqual(run(1, "auto"), (1, output))
-        # Host profiles serve AMD CPUs too, so an AMD host that no built-in
-        # profile serves falls back too, with the issue that tracks profiles
-        # for more AMD CPUs, and a host profile that fails on it fails for
-        # another reason, which OpenVMM explains.
-        status, output = run(1, None, host=zen3)
-        self.assertIn("AuthenticAMD 25/33/0, so --cpu-profile auto", output)
-        self.assertIn(cpu_profile_request_url(zen3), output)
-        self.assertIn("https://github.com/microsoft/nvx/issues/409", output)
-        self.assertNotIn("issues/408", output)
-        self.assertEqual(run(1, "host", host=zen3), (1, ""))
-        # Host profiles serve only Intel and AMD CPUs, so another vendor's
-        # host still fails, with either request.
-        hygon = HostCpu("HygonGenuine", 24, 0, 1)
-        status, output = run(1, None, host=hygon)
-        self.assertIn(
-            "HygonGenuine 24/0/1, so a cold boot with --cpu-profile auto, the "
-            "default, fails on it with E_PROFILE_HOST_UNKNOWN",
-            output,
-        )
-        self.assertIn("host CPU profiles serve only Intel and AMD CPUs", output)
-        self.assertNotIn("cpu-profile.yml", output)
-        self.assertEqual(run(1, "host", host=hygon), (1, output))
-        # Successful runs, restores, other requests and CPUs, and an unknown
-        # CPU get no guidance.
-        for returncode, cpu_profile, cold_boot, host in (
-            (0, None, True, tiger_lake),
-            (1, None, False, tiger_lake),
-            (1, "host", True, tiger_lake),
-            (1, "intel.alderlake.v1", True, tiger_lake),
-            (1, None, True, HostCpu("GenuineIntel", 6, 154, 3)),
-            (1, None, True, HostCpu("AuthenticAMD", 25, 1, 1)),
-            (1, None, True, None),
-        ):
-            with self.subTest(
-                returncode=returncode,
-                cpu_profile=cpu_profile,
-                cold_boot=cold_boot,
-                host=host,
-            ):
-                self.assertEqual(
-                    run(returncode, cpu_profile, cold_boot, host), (returncode, "")
-                )
-
-    def test_run_quotes_the_openvmm_path_in_the_cpu_profile_guidance(self):
-        # The guidance's fingerprint command is for copying, so a path with a
-        # space is quoted as the shell of this platform reads it.
-        openvmm = str(Path("/nvx checkout") / "openvmm")
-        stderr = io.StringIO()
-        with (
-            patch.object(nvx.sys, "stderr", stderr),
-            patch.object(
-                nvx.subprocess,
-                "run",
-                return_value=subprocess.CompletedProcess[bytes]([openvmm], 1),
-            ),
-            patch.object(
-                nvx,
-                "host_cpu_signature",
-                return_value=HostCpu("GenuineIntel", 6, 140, 1),
-            ),
-        ):
-            nvx._run_openvmm(  # pyright: ignore[reportPrivateUsage]
-                [openvmm, "--hypervisor", "kvm"], None, True, "kvm"
-            )
-        quoted = (
-            subprocess.list2cmdline([openvmm])
-            if os.name == "nt"
-            else shlex.quote(openvmm)
-        )
-        self.assertNotEqual(quoted, openvmm)
-        self.assertIn(
-            f"nvx:   {quoted} --hypervisor kvm --cpu-fingerprint fingerprint.json\n",
-            stderr.getvalue(),
-        )
-
-    def test_run_passes_its_backend_to_the_cpu_profile_guidance(self):
-        args = nvx.parse_args(["run", "--hypervisor", "kvm"])
-        with (
-            patch.object(nvx, "require_file", return_value=Path("artifact")),
-            patch.object(nvx, "_run_openvmm", return_value=0) as run_openvmm,
-            contextlib.redirect_stdout(io.StringIO()),
-            self.assertRaises(SystemExit),
-        ):
-            nvx.command_run(args)
-        command, cpu_profile, cold_boot, hypervisor = run_openvmm.call_args.args
-        self.assertEqual(command[command.index("--hypervisor") + 1], "kvm")
-        self.assertEqual((cpu_profile, cold_boot, hypervisor), (None, True, "kvm"))
-
     def test_benchmark_refuses_a_cpu_that_no_built_in_profile_serves(self):
         # The command guards the benchmark coordinator, which it runs after.
         self.assertIs(nvx.run_benchmark, benchmark.run)
@@ -1697,204 +1134,6 @@ class CliTests(_CheckoutArtifacts):
             granite_rapids, "--_kvm-worker", openvmm_dir=missing
         )
         self.assertEqual((status, output, len(launched)), (0, "", 1))
-
-    def test_run_leaves_openvmm_the_terminal_to_restore(self):
-        """A guest-triggered shutdown can end OpenVMM while its console holds
-        the terminal in raw mode, and OpenVMM restores the terminal settings
-        only when its standard error is a terminal, so run must leave it
-        one."""
-        if sys.platform != "linux":
-            self.skipTest("needs a Linux pseudo-terminal")
-        import pty
-        import termios
-
-        openvmm = (
-            "import os, termios, tty\n"
-            # OpenVMM saves the settings through standard error, if it is a
-            # terminal, and its console makes standard input raw...
-            "saved = termios.tcgetattr(2) if os.isatty(2) else None\n"
-            "tty.setraw(0)\n"
-            # ...until the guest shuts down.
-            "if saved is not None:\n"
-            "    termios.tcsetattr(2, termios.TCSAFLUSH, saved)\n"
-        )
-        runner = (
-            "import sys\n"
-            f"sys.path.insert(0, {str(Path(__file__).parent)!r})\n"
-            "import nvx\n"
-            "sys.exit(nvx._run_openvmm("
-            f"[sys.executable, '-c', {openvmm!r}], None, cold_boot=False, "
-            "hypervisor='kvm'))\n"
-        )
-        primary, secondary = pty.openpty()
-        try:
-            before = termios.tcgetattr(secondary)
-            completed = subprocess.run(
-                [sys.executable, "-c", runner],
-                stdin=secondary,
-                stdout=secondary,
-                stderr=secondary,
-                timeout=60,
-                check=False,
-            )
-            after = termios.tcgetattr(secondary)
-            output = b""
-            while select.select([primary], [], [], 0)[0]:
-                chunk = os.read(primary, 65536)
-                if not chunk:
-                    break
-                output += chunk
-        finally:
-            os.close(secondary)
-            os.close(primary)
-        self.assertEqual(completed.returncode, 0, output.decode(errors="replace"))
-        self.assertEqual(after, before, "the terminal was left in raw mode")
-
-    def test_run_exposes_restore_readiness(self):
-        args = nvx.parse_args(
-            [
-                "run",
-                "--hypervisor",
-                "mshv",
-                "--restore-snapshot",
-                "snapshot",
-                "--processors",
-                "4",
-                "--restore-processors",
-                "2",
-                "--restore-ready-path",
-                "ready.sock",
-                "--dry-run",
-            ]
-        )
-
-        with (
-            patch.object(nvx, "require_file", return_value=Path("openvmm")) as require,
-            patch.object(
-                nvx, "_format_command", return_value="formatted"
-            ) as format_command,
-        ):
-            nvx.command_run(args)
-
-        require.assert_called_once()
-        command = format_command.call_args.args[0]
-        self.assertEqual(
-            command,
-            [
-                "openvmm",
-                "--single-process",
-                "--machine",
-                "microvm",
-                "--processors",
-                "4",
-                "--hypervisor",
-                "mshv",
-                "--restore-snapshot",
-                "snapshot",
-                "--restore-processors",
-                "2",
-                "--restore-ready-path",
-                "ready.sock",
-            ],
-        )
-
-        missing_snapshot = nvx.parse_args(
-            ["run", "--restore-ready-path", "ready.sock", "--dry-run"]
-        )
-        with self.assertRaisesRegex(
-            common.ScriptError, "--restore-ready-path requires --restore-snapshot"
-        ):
-            nvx.command_run(missing_snapshot)
-
-        missing_processor_snapshot = nvx.parse_args(
-            ["run", "--restore-processors", "1", "--dry-run"]
-        )
-        with self.assertRaisesRegex(
-            common.ScriptError, "--restore-processors requires --restore-snapshot"
-        ):
-            nvx.command_run(missing_processor_snapshot)
-
-        invalid_restore_capacity = nvx.parse_args(
-            [
-                "run",
-                "--processors",
-                "2",
-                "--restore-snapshot",
-                "snapshot",
-                "--restore-processors",
-                "4",
-                "--dry-run",
-            ]
-        )
-        with self.assertRaisesRegex(common.ScriptError, "cannot exceed"):
-            nvx.command_run(invalid_restore_capacity)
-
-        legacy = nvx.parse_args(["run", "--restore-snapshot", "snapshot", "--dry-run"])
-        with (
-            patch.object(nvx, "require_file", return_value=Path("openvmm")),
-            patch.object(
-                nvx, "_format_command", return_value="formatted"
-            ) as format_command,
-        ):
-            nvx.command_run(legacy)
-        self.assertIn("microvm", format_command.call_args.args[0])
-        self.assertNotIn("microvm-v2", format_command.call_args.args[0])
-
-        capture_memory = nvx.parse_args(
-            [
-                "run",
-                "--memory-mib",
-                "512",
-                "--memory-capacity-mib",
-                "2048",
-                "--dry-run",
-            ]
-        )
-        with (
-            patch.object(nvx, "require_file", return_value=Path("artifact")),
-            patch.object(
-                nvx, "_format_command", return_value="formatted"
-            ) as format_command,
-        ):
-            nvx.command_run(capture_memory)
-        command = format_command.call_args.args[0]
-        self.assertEqual(command[command.index("--memory") + 1], "512M")
-        self.assertEqual(command[command.index("--memory-capacity") + 1], "2048M")
-
-        restore_memory = nvx.parse_args(
-            [
-                "run",
-                "--restore-snapshot",
-                "snapshot",
-                "--restore-memory-mib",
-                "1024",
-                "--dry-run",
-            ]
-        )
-        with (
-            patch.object(nvx, "require_file", return_value=Path("openvmm")),
-            patch.object(
-                nvx, "_format_command", return_value="formatted"
-            ) as format_command,
-        ):
-            nvx.command_run(restore_memory)
-        command = format_command.call_args.args[0]
-        self.assertEqual(command[command.index("--restore-memory") + 1], "1024M")
-        self.assertNotIn("--memory-capacity", command)
-
-        smp = nvx.parse_args(
-            ["run", "--machine", "microvm", "--processors", "2", "--dry-run"]
-        )
-        self.assertEqual(smp.machine, "microvm")
-        self.assertEqual(smp.processors, 2)
-
-        with self.assertRaises(SystemExit):
-            nvx.parse_args(
-                ["run", "--machine", "microvm-v2", "--processors", "4", "--dry-run"]
-            )
-
-        with self.assertRaises(SystemExit):
-            nvx.parse_args(["run", "--machine", "microvm-v3", "--dry-run"])
 
     def test_openvmm_command_passes_restore_choice_in_build_config(self):
         with patch.object(nvx, "build_openvmm") as build_openvmm:
@@ -2065,6 +1304,22 @@ import nvx
 from nvx_tools import nvx_rs
 
 nvx_rs.ROOT = Path(sys.argv[2])
+raise SystemExit(nvx.main(sys.argv[3:]))
+"""
+# Runs nvx.main as NVX_PY_REAL_DRIVER does, on a host whose CPU, a Tiger Lake,
+# no built-in CPU profile serves.
+NVX_PY_UNSERVED_CPU_DRIVER = r"""
+import sys
+from pathlib import Path
+
+sys.path.insert(0, sys.argv[1])
+sys.argv[0] = "nvx.py"
+import nvx
+from nvx_tools import nvx_rs
+from nvx_tools.time_abi import HostCpu
+
+nvx_rs.ROOT = Path(sys.argv[2])
+nvx.host_cpu_signature = lambda: HostCpu("GenuineIntel", 6, 140, 1)
 raise SystemExit(nvx.main(sys.argv[3:]))
 """
 
@@ -2839,7 +2094,7 @@ class SandboxDelegationTests(unittest.TestCase):
         # Abbreviations are resolved, the order is kept, and every value is
         # attached, so that a value that starts with "-" stays a value.
         self.assertEqual(
-            args.sandbox_arguments,
+            args.nvx_rs_arguments,
             [
                 "--layer=distro,a.erofs,11111111-1111-1111-1111-111111111111",
                 "--scratch=s.ext4",
@@ -2863,7 +2118,7 @@ class SandboxDelegationTests(unittest.TestCase):
             self.assertFalse(hasattr(args, name), name)
         default = nvx.parse_args(["sandbox"])
         self.assertEqual(default.sandbox_operation, "run")
-        self.assertEqual(default.sandbox_arguments, [])
+        self.assertEqual(default.nvx_rs_arguments, [])
 
     def test_sandbox_runs_nvx_rs_and_exits_with_its_status(self):
         program = argparse.ArgumentParser().prog
@@ -3059,6 +2314,433 @@ class SandboxDelegationTests(unittest.TestCase):
                 f"error: sandbox state path is not a plain directory: "
                 f"{root / 'state'}\n",
             )
+
+
+def _artifact_root(directory: Path) -> Path:
+    """Create the artifacts of a cold boot below `directory`, which nvx-rs
+    checks but does not read, and return its resolved path."""
+    root = directory.resolve()
+    openvmm = f"openvmm/target/release/openvmm{'.exe' if os.name == 'nt' else ''}"
+    for relative in ("build/vmlinux", "build/initramfs.cpio.gz", openvmm):
+        path = root / relative
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_bytes(b"artifact")
+    return root
+
+
+def _run_nvx_py(
+    driver: str,
+    root: Path,
+    *arguments: str,
+    environment: Mapping[str, str] | None = None,
+) -> subprocess.CompletedProcess[bytes]:
+    """Run nvx.py ARGUMENTS with `driver` and the artifact root `root`."""
+    return subprocess.run(
+        [sys.executable, "-c", driver, str(SCRIPTS_DIRECTORY), str(root), *arguments],
+        cwd=root,
+        env={**os.environ, **(environment or {})},
+        capture_output=True,
+        timeout=60,
+        check=False,
+    )
+
+
+def _text(data: bytes) -> str:
+    return data.decode("utf-8").replace("\r\n", "\n")
+
+
+class RunDelegationTests(unittest.TestCase):
+    TIGER_LAKE = HostCpu("GenuineIntel", 6, 140, 1, "Intel(R) Core(TM) i7-1185G7")
+
+    def setUp(self) -> None:
+        super().setUp()
+        # On a host whose CPU a built-in profile serves, nvx.py passes no
+        # guidance, and looks up no artifact.
+        patcher = patch.object(
+            nvx, "host_cpu_signature", return_value=HostCpu("GenuineIntel", 6, 154, 3)
+        )
+        patcher.start()
+        self.addCleanup(patcher.stop)
+
+    def test_run_records_canonical_options_in_command_line_order(self):
+        args = nvx.parse_args(
+            [
+                "run",
+                "--gu",
+                "ubuntu",
+                "--memory-m",
+                "1_024",
+                "--memory-c=2048",
+                "--proc",
+                " 2 ",
+                "--cpu",
+                "host",
+                "--mount=/a,dir-a",
+                "--mount-d",
+                "x",
+                "--mount",
+                "/b,dir-b,rw",
+                "--mount-w=y",
+                "--mount-o",
+                "vmm",
+                "--network-prof",
+                "portable",
+                "--net",
+                "10.0.0.2/24",
+                "--network-egress-p",
+                "policy.json",
+                "--out",
+                "report.json",
+                "--cmdline=-x",
+                "--restore-s",
+                "snapshot",
+                "--restore-p=1",
+                "--dry",
+                "--hyp",
+                "kvm",
+                "--memory-mib=-5",
+            ]
+        )
+        # Abbreviations are resolved, the order is kept, and every value is
+        # attached, so that a value that starts with "-" stays a value.
+        self.assertEqual(
+            args.nvx_rs_arguments,
+            [
+                "--guest=ubuntu",
+                "--memory-mib=1_024",
+                "--memory-capacity-mib=2048",
+                "--processors= 2 ",
+                "--cpu-profile=host",
+                "--mount=/a,dir-a",
+                "--mount-deny=x",
+                "--mount=/b,dir-b,rw",
+                "--mount-write=y",
+                "--mount-owner=vmm",
+                "--network-profile=portable",
+                "--net=10.0.0.2/24",
+                "--network-egress-policy-file=policy.json",
+                "--outcome-report=report.json",
+                "--cmdline=-x",
+                "--restore-snapshot=snapshot",
+                "--restore-processors=1",
+                "--dry-run",
+                "--hypervisor=kvm",
+                "--memory-mib=-5",
+            ],
+        )
+        # nvx-rs converts, checks, and defaults every value; nvx.py keeps the
+        # ones that its CPU-profile guidance reads, as given.
+        self.assertIs(args.handler, nvx.command_run)
+        self.assertEqual(
+            (args.cpu_profile, args.restore_snapshot, args.dry_run, args.hypervisor),
+            ("host", "snapshot", True, "kvm"),
+        )
+        default = nvx.parse_args(["run"])
+        self.assertEqual(default.nvx_rs_arguments, [])
+        for name in ("guest", "memory_mib", "processors", "cmdline", "dry_run"):
+            self.assertFalse(hasattr(default, name), name)
+
+    def test_run_runs_nvx_rs_and_exits_with_its_status(self):
+        program = argparse.ArgumentParser().prog
+        with patch.object(nvx_rs, "run", return_value=7) as run:
+            self.assertEqual(
+                nvx.main(["run", "--guest", "ubuntu", "--processors", "3"]), 7
+            )
+        # argparse no longer converts the processor count, which nvx-rs
+        # converts and refuses itself.
+        run.assert_called_once_with(
+            ["run", "--guest=ubuntu", "--processors=3"], program=program
+        )
+
+    def test_run_usage_errors_stay_with_argparse(self):
+        for arguments in (
+            ["run", "--bogus"],
+            ["run", "extra"],
+            ["run", "--guest", "debian"],
+            ["run", "--machine", "microvm-v2"],
+            ["run", "--mount-owner", "root"],
+            ["run", "--network-egress", "block"],
+            ["run", "--memory-mib"],
+            ["run", "--dry-run=1"],
+        ):
+            with (
+                self.subTest(arguments=arguments),
+                patch.object(nvx_rs, "run") as run,
+                patch("sys.stderr", new_callable=io.StringIO),
+                self.assertRaises(SystemExit) as raised,
+            ):
+                nvx.main(arguments)
+            self.assertEqual(raised.exception.code, 2)
+            run.assert_not_called()
+
+    def test_run_reports_a_missing_nvx_rs_as_an_error(self):
+        stderr = io.StringIO()
+        with (
+            patch.object(
+                nvx_rs, "require_binary", side_effect=common.ScriptError("no nvx-rs")
+            ),
+            contextlib.redirect_stderr(stderr),
+        ):
+            self.assertEqual(nvx.main(["run", "--dry-run"]), 1)
+        self.assertEqual(stderr.getvalue(), "error: no nvx-rs\n")
+
+    def _guidance(
+        self,
+        host: HostCpu | None,
+        arguments: list[str],
+        openvmm: Path = Path("/nvx/openvmm/target/release/openvmm"),
+    ) -> tuple[list[str], int]:
+        """Run `nvx.py run ARGUMENTS` on the CPU `host`, and return the
+        guidance options that nvx.py passes nvx-rs, and how many times it
+        looked up the artifacts."""
+        artifacts = nvx_rs.ArtifactPaths(
+            openvmm=openvmm, kernel=Path("vmlinux"), guests=()
+        )
+        with (
+            patch.object(nvx, "host_cpu_signature", return_value=host),
+            patch.object(nvx_rs, "artifacts", return_value=artifacts) as lookup,
+            patch.object(nvx_rs, "run", return_value=1) as run,
+        ):
+            self.assertEqual(nvx.main(["run", *arguments]), 1)
+        passed = cast(list[str], run.call_args.args[0])
+        guidance = [
+            argument
+            for argument in passed
+            if argument.startswith("--cold-boot-guidance=")
+        ]
+        # The guidance follows the options that the user gave.
+        self.assertEqual(passed[: len(passed) - len(guidance)][0], "run")
+        self.assertEqual(passed[len(passed) - len(guidance) :], guidance)
+        return guidance, lookup.call_count
+
+    def test_run_passes_the_cpu_profile_guidance_only_where_it_applies(self):
+        openvmm = Path("/nvx/openvmm/target/release/openvmm")
+        hygon = HostCpu("HygonGenuine", 24, 0, 1)
+
+        def expected(cpu_profile: str | None, host: HostCpu, hypervisor: str) -> str:
+            guidance = host_cpu_profile_guidance(
+                cpu_profile,
+                host,
+                nvx._format_command([os.fspath(openvmm)]),
+                hypervisor,
+            )
+            assert guidance is not None
+            return f"--cold-boot-guidance={guidance}"
+
+        default = nvx._hypervisor("auto")
+        # A cold boot with auto on a CPU that no built-in profile serves, or
+        # with host on a CPU that host profiles do not serve either, gets the
+        # guidance, with the OpenVMM that nvx-rs runs and the backend.
+        for host, arguments, guidance in (
+            (self.TIGER_LAKE, [], expected(None, self.TIGER_LAKE, default)),
+            (
+                self.TIGER_LAKE,
+                ["--cpu-profile", "auto", "--hypervisor", "mshv"],
+                expected("auto", self.TIGER_LAKE, "mshv"),
+            ),
+            (hygon, [], expected(None, hygon, default)),
+            (hygon, ["--cpu-profile", "host"], expected("host", hygon, default)),
+        ):
+            with self.subTest(host=host, arguments=arguments):
+                self.assertEqual(
+                    self._guidance(host, arguments, openvmm), ([guidance], 1)
+                )
+        # A dry run, a restore, another profile, and a CPU that a built-in
+        # profile serves or that nvx.py cannot identify get none, and nvx.py
+        # does not look up the artifacts for them.
+        for host, arguments in (
+            (self.TIGER_LAKE, ["--dry-run"]),
+            (self.TIGER_LAKE, ["--restore-snapshot", "snapshot"]),
+            (self.TIGER_LAKE, ["--restore-snapshot="]),
+            (self.TIGER_LAKE, ["--cpu-profile", "host"]),
+            (self.TIGER_LAKE, ["--cpu-profile", "intel.alderlake.v1"]),
+            (HostCpu("GenuineIntel", 6, 154, 3), []),
+            (HostCpu("AuthenticAMD", 25, 1, 1), []),
+            (None, []),
+        ):
+            with self.subTest(host=host, arguments=arguments):
+                self.assertEqual(self._guidance(host, arguments), ([], 0))
+
+    def test_run_quotes_the_openvmm_path_in_the_cpu_profile_guidance(self):
+        # The guidance's fingerprint command is for copying, so a path with a
+        # space is quoted as the shell of this platform reads it.
+        openvmm = Path("/nvx checkout") / "openvmm"
+        guidance, _ = self._guidance(
+            self.TIGER_LAKE, ["--hypervisor", "kvm"], openvmm=openvmm
+        )
+        quoted = (
+            subprocess.list2cmdline([str(openvmm)])
+            if os.name == "nt"
+            else shlex.quote(str(openvmm))
+        )
+        self.assertNotEqual(quoted, str(openvmm))
+        self.assertIn(
+            f"nvx:   {quoted} --hypervisor kvm --cpu-fingerprint fingerprint.json\n",
+            guidance[0],
+        )
+
+    @unittest.skipUnless(
+        os.environ.get("NVX_RS"), "set NVX_RS to an nvx-rs executable to run"
+    )
+    def test_the_real_nvx_rs_runs_the_options_that_nvx_py_reads(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = _artifact_root(Path(temporary))
+            result = _run_nvx_py(
+                NVX_PY_REAL_DRIVER,
+                root,
+                "run",
+                "--dry",
+                "--memory-m=256",
+                "--cmdline=-x",
+                "--hyp",
+                "kvm",
+            )
+            self.assertEqual(result.returncode, 0, result.stderr)
+            self.assertEqual(result.stderr, b"")
+            command = _text(result.stdout)
+            self.assertTrue(command.startswith(">> "), command)
+            for expected in ("--hypervisor kvm --memory 256M", "--cmdline -x\n"):
+                self.assertIn(expected, command)
+            # A value that nvx-rs refuses is a usage error of nvx.py run.
+            result = _run_nvx_py(
+                NVX_PY_REAL_DRIVER, root, "run", "--processors", "3", "--dry-run"
+            )
+            self.assertEqual(result.returncode, 2)
+            stderr = _text(result.stderr)
+            self.assertTrue(stderr.startswith("usage: nvx.py run [-h] "), stderr)
+            self.assertTrue(
+                stderr.endswith(
+                    "nvx.py run: error: argument --processors: invalid choice: '3' "
+                    "(choose from '1', '2', '4', '8')\n"
+                ),
+                stderr,
+            )
+            result = _run_nvx_py(
+                NVX_PY_REAL_DRIVER, root, "run", "--net", "10.0.0.2/24", "--dry-run"
+            )
+            self.assertEqual(result.returncode, 1)
+            self.assertEqual(
+                _text(result.stderr),
+                "error: --net and --network-profile must be specified together\n",
+            )
+
+    @unittest.skipUnless(
+        os.environ.get("NVX_RS"), "set NVX_RS to an nvx-rs executable to run"
+    )
+    @unittest.skipIf(os.name == "nt", "needs an OpenVMM shell script")
+    def test_the_real_nvx_rs_guides_a_failed_cold_boot(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = _artifact_root(Path(temporary))
+            openvmm = root / "failing openvmm"
+            openvmm.write_text("#!/bin/sh\nexit 1\n", encoding="utf-8")
+            openvmm.chmod(0o755)
+            environment = {"NVX_OPENVMM": str(openvmm)}
+
+            def run(*arguments: str) -> subprocess.CompletedProcess[bytes]:
+                return _run_nvx_py(
+                    NVX_PY_UNSERVED_CPU_DRIVER,
+                    root,
+                    "run",
+                    "--hypervisor",
+                    "kvm",
+                    *arguments,
+                    environment=environment,
+                )
+
+            # OpenVMM fails the cold boot, and the guidance follows, with the
+            # OpenVMM that NVX_OPENVMM names.
+            result = run()
+            self.assertEqual(result.returncode, 1, result.stderr)
+            self.assertTrue(
+                _text(result.stdout).startswith(f">> {shlex.quote(str(openvmm))} "),
+                result.stdout,
+            )
+            stderr = _text(result.stderr)
+            self.assertTrue(
+                stderr.startswith(
+                    "nvx: no built-in CPU profile serves this host's CPU, "
+                    "GenuineIntel 6/140/1, so --cpu-profile auto"
+                ),
+                stderr,
+            )
+            self.assertIn(
+                f"nvx:   {shlex.quote(str(openvmm))} --hypervisor kvm "
+                "--cpu-fingerprint fingerprint.json\n",
+                stderr,
+            )
+            # A restore that fails, a dry run, and a refused option get none.
+            for arguments, status in (
+                (["--restore-snapshot", str(root / "snapshot")], 1),
+                (["--dry-run"], 0),
+                (["--net", "10.0.0.2/24"], 1),
+            ):
+                with self.subTest(arguments=arguments):
+                    result = run(*arguments)
+                    self.assertEqual(result.returncode, status, result.stderr)
+                    self.assertNotIn(b"nvx: ", result.stderr)
+
+    @unittest.skipUnless(
+        os.environ.get("NVX_RS"), "set NVX_RS to an nvx-rs executable to run"
+    )
+    def test_run_leaves_openvmm_the_terminal_to_restore(self):
+        """A guest-triggered shutdown can end OpenVMM while its console holds
+        the terminal in raw mode, and OpenVMM restores the terminal settings
+        only when its standard error is a terminal, so nvx.py run, and the
+        nvx-rs run that it runs, must leave it one."""
+        if sys.platform != "linux":
+            self.skipTest("needs a Linux pseudo-terminal")
+        import pty
+        import termios
+
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary).resolve()
+            # OpenVMM saves the settings through standard error, if it is a
+            # terminal, and its console makes standard input raw until the
+            # guest shuts down. A restore needs no kernel or initramfs.
+            openvmm = root / "openvmm"
+            openvmm.write_text(
+                f"#!{sys.executable}\n"
+                "import os, termios, tty\n"
+                "saved = termios.tcgetattr(2) if os.isatty(2) else None\n"
+                "tty.setraw(0)\n"
+                "if saved is not None:\n"
+                "    termios.tcsetattr(2, termios.TCSAFLUSH, saved)\n",
+                encoding="utf-8",
+            )
+            openvmm.chmod(0o755)
+            primary, secondary = pty.openpty()
+            try:
+                before = termios.tcgetattr(secondary)
+                completed = subprocess.run(
+                    [
+                        sys.executable,
+                        "-c",
+                        NVX_PY_REAL_DRIVER,
+                        str(SCRIPTS_DIRECTORY),
+                        str(root),
+                        "run",
+                        "--restore-snapshot",
+                        str(root / "snapshot"),
+                    ],
+                    stdin=secondary,
+                    stdout=secondary,
+                    stderr=secondary,
+                    env={**os.environ, "NVX_OPENVMM": str(openvmm)},
+                    timeout=60,
+                    check=False,
+                )
+                after = termios.tcgetattr(secondary)
+                output = b""
+                while select.select([primary], [], [], 0)[0]:
+                    chunk = os.read(primary, 65536)
+                    if not chunk:
+                        break
+                    output += chunk
+            finally:
+                os.close(secondary)
+                os.close(primary)
+        self.assertEqual(completed.returncode, 0, output.decode(errors="replace"))
+        self.assertEqual(after, before, "the terminal was left in raw mode")
 
 
 class CiTests(unittest.TestCase):
@@ -11443,6 +11125,13 @@ def _shell_function(source: str, name: str) -> str:
     return source[start : source.index("\n}\n", start) + 3]
 
 
+def _aggregate_child_name(index: int, target: str) -> str:
+    """Return the name that nvx-rs gives the child of an aggregate share at
+    `index` that the guest binds at `target`: the index, a hyphen, and the first
+    32 hexadecimal digits of the SHA-256 digest of the target."""
+    return f"{index}-{hashlib.sha256(target.encode()).hexdigest()[:32]}"
+
+
 class SandboxShareAgentTests(unittest.TestCase):
     AGENT = Path(__file__).parents[1] / "guest" / "common" / "nvx-init-agent"
 
@@ -11741,8 +11430,8 @@ class SandboxShareAgentTests(unittest.TestCase):
 
     def test_agent_binds_children_by_the_names_that_nvx_gives_them(self):
         rootfs = self.rootfs.as_posix()
-        workspace = sandbox.aggregate_child_name(0, "/workspace")
-        tools = sandbox.aggregate_child_name(1, "/opt/tools")
+        workspace = _aggregate_child_name(0, "/workspace")
+        tools = _aggregate_child_name(1, "/opt/tools")
         result, log = self._run(
             self._aggregate(
                 f"{workspace},/workspace,rw", f"{tools},/opt/tools,ro", "a.b_C-9,/x,ro"
@@ -11787,7 +11476,7 @@ class SandboxShareAgentTests(unittest.TestCase):
                 check=False,
             )
 
-        name = sandbox.aggregate_child_name(0, "/workspace")
+        name = _aggregate_child_name(0, "/workspace")
         for share, expected in (
             (f"{name},/workspace,rw", f"{name}|/workspace|rw|directory\n"),
             ("0,/opt/tools,ro", "0|/opt/tools|ro|directory\n"),
@@ -13207,406 +12896,6 @@ class AgentBundlingTests(unittest.TestCase):
     def test_check_fails_when_a_rejection_reports_another_cause(self):
         with self.assertRaisesRegex(common.ScriptError, "/linux/kernel_sha256"):
             self._check(self._outcomes(pinned=(101, "cannot read the bundle")))
-
-
-class RunShareTests(_CheckoutArtifacts):
-    """The share helpers of sandbox.py, which `nvx.py run` uses; nvx-rs owns
-    those of `nvx.py sandbox`."""
-
-    def test_mount_value_defaults_to_read_only_and_accepts_rw(self):
-        self.assertEqual(
-            sandbox.parse_mount_value("/workspace,host-dir"),
-            ("/workspace", "host-dir", "ro"),
-        )
-        self.assertEqual(
-            sandbox.parse_mount_value("/opt/hostedtoolcache,host-dir,rw"),
-            ("/opt/hostedtoolcache", "host-dir", "rw"),
-        )
-
-    def test_mount_value_rejects_malformed_specifications(self):
-        for value, message in (
-            ("/workspace", "GUEST_TARGET,HOST_PATH"),
-            ("/workspace,", "host path is empty"),
-            ("/workspace,,rw", "host path is empty"),
-            ("/workspace,host,rx", "unsupported --mount mode 'rx'"),
-            # With more than one comma, the value must end in the mode, which
-            # the error suggests for a host path that contains commas.
-            ("/workspace,host,rw,extra", "mode 'extra'.*if HOST_PATH contains commas"),
-            ("/workspace,alpha,beta", "mode 'beta'.*if HOST_PATH contains commas"),
-        ):
-            with self.subTest(value=value):
-                with self.assertRaisesRegex(common.ScriptError, message):
-                    sandbox.parse_mount_value(value)
-
-    def test_mount_value_accepts_host_paths_with_commas(self):
-        alpha_path = r"C:\projects\alpha,beta"
-        reports_path = r"C:\reports\2026, final"
-        for value, target, host_path, access in (
-            (f"/work,{alpha_path},rw", "/work", alpha_path, "rw"),
-            (f"/reports,{reports_path},ro", "/reports", reports_path, "ro"),
-            # A host path that ends in a comma, or in what looks like a mode,
-            # keeps it before the mode.
-            ("/data,/srv/data,rw,ro", "/data", "/srv/data,rw", "ro"),
-            ("/data,/srv/data,,rw", "/data", "/srv/data,", "rw"),
-            # Values without commas in the host path keep their meaning.
-            ("/data,/srv/data,rw", "/data", "/srv/data", "rw"),
-            ("/data,/srv/data", "/data", "/srv/data", "ro"),
-        ):
-            with self.subTest(value=value):
-                self.assertEqual(
-                    sandbox.parse_mount_value(value), (target, host_path, access)
-                )
-
-    def test_caller_owner_requires_a_linux_host(self):
-        with patch.object(sandbox.os, "name", "nt"):
-            with self.assertRaisesRegex(common.ScriptError, "requires a Linux host"):
-                sandbox.require_mount_owner_supported("caller")
-            sandbox.require_mount_owner_supported("vmm")
-        with patch.object(sandbox.os, "name", "posix"):
-            sandbox.require_mount_owner_supported("caller")
-
-    def test_aggregate_child_names_pin_their_targets(self):
-        name = sandbox.aggregate_child_name(0, "/workspace")
-        self.assertEqual(name, f"0-{hashlib.sha256(b'/workspace').hexdigest()[:32]}")
-        # Equal targets give equal names, so a restore names its children as
-        # the boot did, and another target or position gives another name.
-        self.assertEqual(sandbox.aggregate_child_name(0, "/workspace"), name)
-        self.assertNotEqual(sandbox.aggregate_child_name(0, "/workspace2"), name)
-        self.assertNotEqual(sandbox.aggregate_child_name(1, "/workspace"), name)
-        # Every name follows OpenVMM's rule for the name of a child.
-        for index, target in ((0, "/w"), (999, "/" + "x" * 1000)):
-            self.assertRegex(
-                sandbox.aggregate_child_name(index, target),
-                r"\A[0-9]+-[0-9a-f]{32}\Z",
-            )
-        self.assertLessEqual(len(sandbox.aggregate_child_name(999, "/w")), 64)
-
-    def test_run_attaches_a_file_as_an_aggregate_child(self):
-        with tempfile.TemporaryDirectory() as temporary:
-            root = Path(temporary)
-            settings = root / "settings.json"
-            settings.write_bytes(b"{}")
-            work = root / "work"
-            work.mkdir()
-            with (
-                patch.object(nvx, "require_file", return_value=Path("artifact")),
-                patch.object(
-                    nvx, "_format_command", return_value="formatted"
-                ) as format_command,
-            ):
-                nvx.command_run(
-                    nvx.parse_args(
-                        [
-                            "run",
-                            "--mount",
-                            f"/config/settings.json,{settings},ro",
-                            "--dry-run",
-                        ]
-                    )
-                )
-                command = format_command.call_args.args[0]
-                name = sandbox.aggregate_child_name(0, "/config/settings.json")
-                # Even alone, a file is the child of an aggregate.
-                self.assertNotIn("--mount", command)
-                self.assertEqual(
-                    command[command.index("--mount-aggregate") + 1], "/run/nvx/shares"
-                )
-                self.assertEqual(
-                    command[command.index("--mount-child") + 1],
-                    f"{name},{settings},ro,file",
-                )
-                self.assertEqual(
-                    command[command.index("--cmdline") + 1],
-                    f"nvx_share={name},/config/settings.json,ro,file",
-                )
-
-                # A directory and a file share the aggregate, and only the
-                # file's token is marked.
-                nvx.command_run(
-                    nvx.parse_args(
-                        [
-                            "run",
-                            "--mount",
-                            f"/work,{work},rw",
-                            "--mount",
-                            f"/config/settings.json,{settings},ro",
-                            "--dry-run",
-                        ]
-                    )
-                )
-                command = format_command.call_args.args[0]
-                work_name, settings_name = (
-                    sandbox.aggregate_child_name(index, target)
-                    for index, target in enumerate(("/work", "/config/settings.json"))
-                )
-                self.assertEqual(
-                    command[command.index("--cmdline") + 1],
-                    f"nvx_share={work_name},/work,rw "
-                    f"nvx_share={settings_name},/config/settings.json,ro,file",
-                )
-
-                for arguments, message in (
-                    (["--mount-deny", "secrets"], "absolute host path"),
-                    (["--cmdline", "x" * 1024], "1024-byte"),
-                ):
-                    with self.subTest(arguments=arguments):
-                        invalid = nvx.parse_args(
-                            [
-                                "run",
-                                "--mount",
-                                f"/config/settings.json,{settings},ro",
-                                *arguments,
-                                "--dry-run",
-                            ]
-                        )
-                        with self.assertRaisesRegex(common.ScriptError, message):
-                            nvx.command_run(invalid)
-                invalid = nvx.parse_args(
-                    ["run", f"--mount=/a b,{settings}", "--dry-run"]
-                )
-                with self.assertRaisesRegex(
-                    common.ScriptError, "invalid --mount target"
-                ):
-                    nvx.command_run(invalid)
-
-    def test_run_shares_host_paths_with_commas(self):
-        with tempfile.TemporaryDirectory() as temporary:
-            root = Path(temporary)
-            alpha = root / "alpha,beta"
-            reports = root / "2026, final"
-            settings = root / "settings,v2.json"
-            alpha.mkdir()
-            reports.mkdir()
-            settings.write_bytes(b"{}")
-            with (
-                patch.object(nvx, "require_file", return_value=Path("artifact")),
-                patch.object(
-                    nvx, "_format_command", return_value="formatted"
-                ) as format_command,
-            ):
-                # The mode follows the last comma, so a lone directory stays a
-                # plain --mount of its exact path, and OpenVMM gets the mode
-                # even when the value omits it.
-                for value, expected in (
-                    (f"/work,{alpha},rw", f"/work,{alpha},rw"),
-                    (f"/reports,{reports},ro", f"/reports,{reports},ro"),
-                    (f"/plain,{root}", f"/plain,{root},ro"),
-                ):
-                    with self.subTest(value=value):
-                        nvx.command_run(
-                            nvx.parse_args(["run", "--mount", value, "--dry-run"])
-                        )
-                        command = format_command.call_args.args[0]
-                        self.assertNotIn("--mount-aggregate", command)
-                        self.assertEqual(
-                            command[command.index("--mount") + 1], expected
-                        )
-
-                # Several shares are the children of an aggregate, whose values
-                # end in the mode and, for a file, the `file` flag.
-                nvx.command_run(
-                    nvx.parse_args(
-                        [
-                            "run",
-                            "--mount",
-                            f"/work,{alpha},rw",
-                            "--mount",
-                            f"/reports,{reports},ro",
-                            "--mount",
-                            f"/config/settings.json,{settings},ro",
-                            "--mount-deny",
-                            str(alpha / "secret"),
-                            "--dry-run",
-                        ]
-                    )
-                )
-                command = format_command.call_args.args[0]
-                work, report, config = (
-                    sandbox.aggregate_child_name(index, target)
-                    for index, target in enumerate(
-                        ("/work", "/reports", "/config/settings.json")
-                    )
-                )
-                self.assertEqual(
-                    [
-                        command[index + 1]
-                        for index, value in enumerate(command)
-                        if value == "--mount-child"
-                    ],
-                    [
-                        f"{work},{alpha},rw",
-                        f"{report},{reports},ro",
-                        f"{config},{settings},ro,file",
-                    ],
-                )
-                self.assertEqual(
-                    command[command.index("--mount-deny") + 1], str(alpha / "secret")
-                )
-
-                # Without the mode, the text after the last comma is no mode.
-                for value in (f"/work,{alpha}", f"/reports,{reports}"):
-                    with (
-                        self.subTest(value=value),
-                        self.assertRaisesRegex(
-                            common.ScriptError, "end the value with ,ro or ,rw"
-                        ),
-                    ):
-                        nvx.command_run(
-                            nvx.parse_args(["run", "--mount", value, "--dry-run"])
-                        )
-
-    def test_run_attaches_several_mounts_as_an_aggregate(self):
-        args = nvx.parse_args(
-            [
-                "run",
-                "--mount",
-                "/workspace,work,rw",
-                "--mount",
-                "/opt/hostedtoolcache,tools",
-                "--mount",
-                "/srv/cache,cache,ro",
-                "--cmdline",
-                "quiet",
-                "--dry-run",
-            ]
-        )
-        with (
-            patch.object(nvx, "require_file", return_value=Path("artifact")),
-            patch.object(
-                nvx, "_format_command", return_value="formatted"
-            ) as format_command,
-        ):
-            nvx.command_run(args)
-            command = format_command.call_args.args[0]
-            workspace, toolcache, cache = (
-                sandbox.aggregate_child_name(index, target)
-                for index, target in enumerate(
-                    ("/workspace", "/opt/hostedtoolcache", "/srv/cache")
-                )
-            )
-            booted = [
-                "/run/nvx/shares",
-                f"{workspace},work,rw",
-                f"{toolcache},tools,ro",
-                f"{cache},cache,ro",
-            ]
-            self.assertNotIn("--mount", command)
-            self.assertEqual(
-                [
-                    command[index + 1]
-                    for index, value in enumerate(command)
-                    if value in ("--mount-aggregate", "--mount-child")
-                ],
-                booted,
-            )
-            self.assertEqual(
-                command[command.index("--cmdline") + 1],
-                f"quiet nvx_share={workspace},/workspace,rw "
-                f"nvx_share={toolcache},/opt/hostedtoolcache,ro "
-                f"nvx_share={cache},/srv/cache,ro",
-            )
-
-            # One share stays a plain --mount without bind tokens.
-            single = nvx.parse_args(
-                ["run", "--mount", "/workspace,work,rw", "--dry-run"]
-            )
-            nvx.command_run(single)
-            command = format_command.call_args.args[0]
-            self.assertEqual(
-                command[command.index("--mount") :], ["--mount", "/workspace,work,rw"]
-            )
-            self.assertNotIn("--cmdline", command)
-
-            # A restored guest keeps its binds, so only the devices are named,
-            # with the children's names of the boot: they pin the targets that
-            # the guest bound, and another target names another child.
-            restored = nvx.parse_args(
-                [
-                    "run",
-                    "--restore-snapshot",
-                    "snapshot",
-                    "--mount",
-                    "/workspace,work,rw",
-                    "--mount",
-                    "/opt/hostedtoolcache,tools",
-                    "--mount",
-                    "/srv/cache,cache,ro",
-                    "--dry-run",
-                ]
-            )
-            nvx.command_run(restored)
-            command = format_command.call_args.args[0]
-            self.assertEqual(
-                [
-                    command[index + 1]
-                    for index, value in enumerate(command)
-                    if value in ("--mount-aggregate", "--mount-child")
-                ],
-                booted,
-            )
-            self.assertNotIn("--cmdline", command)
-            retargeted = nvx.parse_args(
-                [
-                    "run",
-                    "--restore-snapshot",
-                    "snapshot",
-                    "--mount",
-                    "/workspace,work,rw",
-                    "--mount",
-                    "/opt/tools,tools",
-                    "--mount",
-                    "/srv/cache,cache,ro",
-                    "--dry-run",
-                ]
-            )
-            nvx.command_run(retargeted)
-            command = format_command.call_args.args[0]
-            children = [
-                command[index + 1]
-                for index, value in enumerate(command)
-                if value == "--mount-child"
-            ]
-            self.assertEqual(children[0::2], booted[1::2])
-            self.assertNotEqual(children[1], booted[2])
-            self.assertEqual(children[1].split(",", 1)[1], "tools,ro")
-
-            for mounts, message in (
-                (["/a,a,rx"], "unsupported --mount mode"),
-                (["/workspace,a", "/workspace/cache,b"], "overlap"),
-                (["/run/nvx,a", "/b,b"], "overlap"),
-                (["/a b,a", "/b,b"], "invalid --mount target"),
-                (["relative,a", "/b,b"], "invalid --mount target"),
-                ([f"/share/{index:02},host" for index in range(60)], "1024-byte"),
-            ):
-                with self.subTest(mounts=mounts[:2]):
-                    invalid = nvx.parse_args(
-                        ["run", *[f"--mount={mount}" for mount in mounts], "--dry-run"]
-                    )
-                    with self.assertRaisesRegex(common.ScriptError, message):
-                        nvx.command_run(invalid)
-            relative = nvx.parse_args(
-                [
-                    "run",
-                    "--mount",
-                    "/a,a",
-                    "--mount",
-                    "/b,b",
-                    "--mount-deny",
-                    "secrets",
-                    "--dry-run",
-                ]
-            )
-            with self.assertRaisesRegex(common.ScriptError, "absolute host path"):
-                nvx.command_run(relative)
-
-    def test_mount_kind_follows_the_host_path(self):
-        with tempfile.TemporaryDirectory() as temporary:
-            root = Path(temporary)
-            settings = root / "settings.json"
-            settings.write_bytes(b"{}")
-            self.assertEqual(sandbox.mount_kind(settings), "file")
-            self.assertEqual(sandbox.mount_kind(root), "directory")
-            self.assertEqual(sandbox.mount_kind(root / "missing"), "directory")
 
 
 class BenchmarkTests(unittest.TestCase):

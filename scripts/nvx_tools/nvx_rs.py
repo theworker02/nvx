@@ -1,8 +1,9 @@
 """Find, build, and run nvx-rs, the Rust command-line interface that nvx.py
 delegates to.
 
-nvx.py runs nvx-rs for `nvx.py sandbox` and for the egress policy and artifact
-steps of `nvx.py run` (nvx-rs/README.md). It runs, in this order:
+nvx.py runs nvx-rs for `nvx.py run` and `nvx.py sandbox`, for the artifact
+lookup of the CPU-profile guidance of `nvx.py run`, and for the egress policies
+of the microVM tests (nvx-rs/README.md). It runs, in this order:
 
 1. the executable that the NVX_RS environment variable names;
 2. nvx-rs/target/release/nvx-rs[.exe] in this checkout, where `cargo build
@@ -540,7 +541,7 @@ def artifacts() -> ArtifactPaths:
     """Return the paths of the artifacts of ROOT with `nvx-rs artifacts`.
 
     OpenVMM is the executable that NVX_OPENVMM names, if set, as for nvx.py
-    sandbox, and otherwise the checkout's.
+    run and nvx.py sandbox, and otherwise the checkout's.
     """
     what = "artifact paths"
     document = _object(query(("artifacts",)), what)

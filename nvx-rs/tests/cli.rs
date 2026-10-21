@@ -3,14 +3,15 @@
 //!
 //! The retired `scripts/nvx_rs_fixtures.py` recorded the scenarios from the Python
 //! implementation of `nvx.py sandbox`, which `nvx-rs` replaced, and from the Python functions
-//! behind `nvx-rs egress compile` and `nvx-rs artifacts`, and `scripts/nvx_rs_run_fixtures.py`
-//! records those whose names start with `run, ` from the Python implementation of `nvx.py run`,
-//! with `nvx-fake-openvmm` as OpenVMM, in a section for POSIX hosts and one for Windows. Each
-//! scenario runs here in a fresh root, with `nvx-rs --root ROOT`, and every step must exit with
-//! the recorded status, print the recorded output, and leave the recorded files, after the root,
-//! process IDs, and random identifiers are replaced with the placeholders that the scripts use.
-//! Now that `nvx.py sandbox` runs `nvx-rs`, the recordings of its scenarios are its reference: a
-//! deliberate change of behavior updates them by hand.
+//! behind `nvx-rs egress compile` and `nvx-rs artifacts`, and the retired
+//! `scripts/nvx_rs_run_fixtures.py` recorded those whose names start with `run, ` from the
+//! Python implementation of `nvx.py run`, with `nvx-fake-openvmm` as OpenVMM, in a section for
+//! POSIX hosts and one for Windows. Each scenario runs here in a fresh root, with
+//! `nvx-rs --root ROOT`, and every step must exit with the recorded status, print the recorded
+//! output, and leave the recorded files, after the root, process IDs, and random identifiers are
+//! replaced with the placeholders that the scripts used. Now that `nvx.py run` and
+//! `nvx.py sandbox` run `nvx-rs`, the recordings are their reference: a deliberate change of
+//! behavior updates them by hand.
 #![cfg(all(
     feature = "cli",
     feature = "testing",

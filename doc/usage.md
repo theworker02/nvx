@@ -21,9 +21,10 @@ python3 scripts/nvx.py performance gate --help
 ## nvx-rs
 
 `nvx.py` runs [`nvx-rs`](../nvx-rs/README.md#the-nvx-rs-cli), the Rust
-implementation of NVX's runtime steps, for the [`sandbox`](#sandbox) command,
-which it runs entirely, and for the egress-policy and artifact steps of
-[`run`](#run). It runs, in this order:
+implementation of NVX's runtime steps, for the [`run`](#run) and
+[`sandbox`](#sandbox) commands, which it runs entirely, for the artifact lookup
+of the CPU-profile guidance of `run`, and for the egress policies of the
+[`test-microvm`](#test-microvm) scenarios. It runs, in this order:
 
 1. the executable that the `NVX_RS` environment variable names;
 2. `nvx-rs/target/release/nvx-rs`, or `nvx-rs.exe` on Windows, in the
@@ -452,7 +453,8 @@ the boot to the managed agent, and runs the ignored `nvx-rs` test
 `tests/managed_lifecycle.rs` with Cargo, which starts OpenVMM with the
 scenario's command line and drives the guest's control session; the scenario
 then checks OpenVMM's outcome report and the guest console. The scenarios that
-drive `sandbox`, or that compile egress policies, run [`nvx-rs`](#nvx-rs). The
+drive `run` or `sandbox`, or that compile egress policies, run
+[`nvx-rs`](#nvx-rs). The
 command requires `build/vmlinux` (with `--debug-kernel`, `build/vmlinux-debug`
 and its `build/vmlinux-debug.config`), the selected initramfs, and
 `openvmm/target/release/openvmm[.exe]`.
@@ -721,12 +723,23 @@ python3 scripts/nvx.py run
 | `--restore-ready-path PATH` | none | Publish one restore-readiness event to an existing Unix socket or Windows named pipe. |
 | `--dry-run` | off | Print the generated OpenVMM command without running it. |
 
-The command requires the OpenVMM release binary, `build/vmlinux`, and the
-selected `build/initramfs*.cpio.gz`, which it looks up with `nvx-rs artifacts`,
-and compiles `--network-egress-policy-file` with `nvx-rs egress compile`; see
-[nvx-rs](#nvx-rs). It builds and runs the OpenVMM command itself. Ubuntu
-selection never falls back to Alpine. See [Run](run.md) for host setup, guest
-shutdown, networking, and virtio-fs examples.
+`run` runs `nvx-rs run` (see [nvx-rs](#nvx-rs)) with the options given, and
+its exit status is the command's: 1 for an error, 2 for a usage error, 130
+after Ctrl-C, and otherwise the status that OpenVMM returns. `nvx-rs` checks
+the options, prints the OpenVMM command after `>> `, and unless `--dry-run` is
+given, runs OpenVMM with the standard streams. A cold boot requires the OpenVMM
+release binary, `build/vmlinux`, and the selected `build/initramfs*.cpio.gz`,
+and a restore only OpenVMM. `nvx.py` parses the options only for its help and
+for the usage errors of unknown options, invalid choices of `--guest`,
+`--hypervisor`, `--machine`, `--mount-owner`, and the network options, and
+missing values, so it still accepts abbreviated options, which it passes to
+`nvx-rs` in full. `nvx-rs` checks their values, the integers and processor
+counts included, and its usage and messages name `nvx.py run`; its usage text
+wraps at 80 columns whatever the terminal's width. On a command line with two
+errors, the one that `nvx.py` reports wins over a value that `nvx-rs` would
+refuse, even when that value comes first, and so does a request for help.
+Ubuntu selection never falls back to Alpine. See [Run](run.md) for host setup,
+guest shutdown, networking, and virtio-fs examples.
 
 If no built-in CPU profile serves an Intel or AMD host's CPU, OpenVMM falls
 back to a host profile and warns with `NVX-CPU-PROFILE-FALLBACK:` at every
@@ -741,7 +754,9 @@ built-in profile serves, OpenVMM exits with `E_PROFILE_HOST_UNKNOWN` before it
 creates the VM, and `run` explains that host profiles cannot boot there
 either. A host whose hypervisor does not support its built-in profile fails
 with `E_PROFILE_UNSUPPORTED` instead, and on an Intel or AMD CPU OpenVMM's
-error itself names `--cpu-profile host`.
+error itself names `--cpu-profile host`. `nvx.py` derives the guidance from its
+CPU catalog, and `nvx-rs run` prints it only after OpenVMM fails a cold boot,
+never after a dry run, a restore, an option that `nvx-rs` refuses, or Ctrl-C.
 
 ### `sandbox`
 
@@ -796,7 +811,8 @@ usage errors of unknown options, invalid choices, and missing values, so it
 still accepts abbreviated options, which it passes to `nvx-rs` in full.
 `nvx-rs` checks their values, and its usage and messages name
 `nvx.py sandbox`; its usage text wraps at 80 columns whatever the terminal's
-width.
+width. As for `run`, an error that `nvx.py` reports, or a request for help,
+wins over a value that `nvx-rs` would refuse, even when that value comes first.
 
 | Option | Default | Description |
 | --- | --- | --- |

@@ -144,7 +144,6 @@ nvx/
 |   |   |-- performance.py       CI performance collection, persistence, and gates
 |   |   |-- process_supervisor.py Linux supervisor for one owned process tree
 |   |   |-- release.py           Release download, source collection, and packaging
-|   |   |-- sandbox.py           Live-share arguments of `nvx.py run`
 |   |   |-- sandbox_lifecycle_tests.py Managed sandbox lifecycle and security tests
 |   |   |-- time_abi.py          Time ABI harness checks and CPU profile guidance
 |   |   `-- ubuntu.py            Verified Ubuntu rootfs and EROFS preparation
@@ -157,7 +156,6 @@ nvx/
 |   |-- nvx-hosts.example.json   Template for the ignored .nvx-hosts.json
 |   |-- nvx.py                   Supported command-line entry point
 |   |-- nvx_adversarial_executor.py Restricted adversarial executor entry point
-|   |-- nvx_rs_run_fixtures.py   Golden scenarios of `nvx.py run` for nvx-rs, recorded from its Python implementation
 |   |-- publish_development_release.py Development release publisher run by CI
 |   `-- test_*.py                Python tooling unit tests
 |-- tests/                       Tests that build on the repository's crates from outside them
@@ -279,8 +277,8 @@ filesystem policies, the compiler of `nvx.py`'s egress policy files, process
 and platform primitives for Linux and Windows
 hosts, the supervision of VM instances, the sandbox launch profile of
 `nvx.py sandbox`, the `nvx-rs` command-line interface that ports
-`nvx.py sandbox`, egress policy compilation, and artifact lookup, and a fake
-OpenVMM for tests. Its
+`nvx.py run`, `nvx.py sandbox`, egress policy compilation, and artifact
+lookup, and a fake OpenVMM for tests. Its
 `guest` feature builds the nine static executables that every guest image
 installs at `/sbin/nvx-*`. It is a
 standalone crate with its own `Cargo.lock`, like `aci_edge_sandboxes`, and

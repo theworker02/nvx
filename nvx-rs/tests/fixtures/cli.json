@@ -1,5 +1,5 @@
 {
-"generator": "scripts/nvx_rs_fixtures.py, retired by microsoft/nvx#359, and scripts/nvx_rs_run_fixtures.py",
+"generator": "scripts/nvx_rs_fixtures.py and scripts/nvx_rs_run_fixtures.py, retired by microsoft/nvx#359 and microsoft/nvx#638",
 "python": "3.14",
 "tree": [
 {"path":"build/vmlinux","text":"kernel\n"},

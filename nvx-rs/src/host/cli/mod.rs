@@ -18,8 +18,8 @@
 //! The artifact root is `--root`, or else the release or repository checkout that holds the
 //! executable, and the `NVX_OPENVMM` environment variable names another OpenVMM executable.
 //! `--prog` names the program in usage and error messages, `nvx-rs` by default: `nvx.py`, which
-//! runs `nvx-rs` for its `sandbox` command, passes its own name, so that its users see the
-//! messages that it printed before it delegated the command.
+//! runs `nvx-rs` for its `run` and `sandbox` commands, passes its own name, so that its users see
+//! the messages that it printed before it delegated the commands.
 //!
 //! Errors print `error: MESSAGE` to standard error and exit with status 1, as `nvx.py` reports a
 //! `ScriptError`. Usage errors print the usage and `PROG: error: MESSAGE`, and exit with status

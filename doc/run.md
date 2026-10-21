@@ -11,7 +11,7 @@ python3 scripts/nvx.py run
 
 This installs the packaged kernel and initramfs under `build/` and OpenVMM
 under `openvmm/target/release/`, so neither needs a local build. It installs
-the package's [`nvx-rs`](usage.md#nvx-rs), which `run` also runs, only when the
+the package's [`nvx-rs`](usage.md#nvx-rs), which runs `run`, only when the
 release was built from the checkout's `nvx-rs` sources; otherwise, `nvx.py`
 builds it with Cargo the first time that a command needs it. Set `GH_TOKEN`
 to a token with contents read access when downloading from a private repository.
