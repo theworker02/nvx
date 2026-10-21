@@ -185,10 +185,12 @@ run the debug kernel on KVM only, while `dev` pushes and full runs run it on
 every backend; each job takes about five minutes on its own runner, in parallel
 with the other microVM jobs. The jobs gate the required status check, the
 development release, and performance persistence. The GitHub-hosted `debug-kernel` job
-builds the debug kernel beside the shared `artifacts` job
+builds the debug kernel beside the other guest artifact jobs
 (`build-guest-artifacts` with `components: debug-kernel`) and caches it under its
 own key, so a kernel rebuild delays only the debug jobs, and a failed debug
-kernel build fails the required status check and blocks the release.
+kernel build fails the required status check and blocks the release. The
+debug jobs also wait for `artifacts`, but not for the Ubuntu and Azure Linux
+images (see [Guest artifact handoff](#guest-artifact-handoff)).
 
 Every job that uses the `validate-runner` action first reports the Linux
 runner's kernel, CPU, clocksource, and TSC flags. It then qualifies the runner
@@ -461,13 +463,16 @@ manually dispatched full run starts these jobs at once: `quality`,
 GitHub-hosted runners, and `openvmm-changes`, which classifies a push or pull
 request and selects every suite for a full run (see
 [Change classification](#change-classification)). When it finishes,
-`artifacts` and `debug-kernel` restore or build the guest artifacts on
-GitHub-hosted runners, the three `build-openvmm-*` producers restore or build
-OpenVMM on a KVM, an MSHV, and a WHP runner, and `openvmm-unit-tests` starts on
-a GitHub-hosted and a WHP runner. `openvmm-vmm-tests` waits for `artifacts`. Each
-microVM test and platform job waits for `artifacts`, its OpenVMM producer, and
-the NVX CLI job of its operating system, and the debug-kernel jobs also wait
-for `debug-kernel`. `Performance regression gate`, `Publish development
+`artifacts`, `distro-artifacts`, and `debug-kernel` restore or build the guest
+artifacts on GitHub-hosted runners (see
+[Guest artifact handoff](#guest-artifact-handoff)), the three `build-openvmm-*`
+producers restore or build OpenVMM on a KVM, an MSHV, and a WHP runner, and
+`openvmm-unit-tests` starts on a GitHub-hosted and a WHP runner.
+`openvmm-vmm-tests` waits for `artifacts`, which builds the kernel and the
+Alpine initramfs. Each microVM test and platform job waits for `artifacts`,
+`distro-artifacts`, its OpenVMM producer, and the NVX CLI job of its operating
+system, and the debug-kernel jobs wait for `debug-kernel` instead of
+`distro-artifacts`. `Performance regression gate`, `Publish development
 release`, `Persist performance baseline`, and `Required status check` wait for
 the jobs whose results they check. Required handoffs between these jobs use
 same-run workflow artifacts; caches only skip rebuilding their inputs.
@@ -536,21 +541,25 @@ would cost about as much as another general WHP runner.
 
 ## Guest artifact handoff
 
-The guest artifact jobs restore or build their components with the
+Three GitHub-hosted jobs restore or build the guest artifacts side by side,
+each with the
 [`build-guest-artifacts`](../.github/actions/build-guest-artifacts/action.yml)
-action, whose `components` input selects them, and upload each component as a
-one-day workflow artifact of its own. Each job that boots or reads guest
-artifacts downloads, by name and into `build/`, only the components that its
-steps read, and waits for the jobs that upload them:
+action, whose `components` input selects what it builds: `artifacts` the
+kernel and the Alpine initramfs, `distro-artifacts` the Ubuntu initramfs, its
+EROFS distro layer, and the sandbox scratch template, together with the Azure
+Linux initramfs, and `debug-kernel` the CI debug kernel. Each job uploads each
+of its components as a one-day workflow artifact of its own. Each job that
+boots or reads guest artifacts downloads, by name and into `build/`, only the
+components that its steps read, and waits only for the jobs that upload them:
 
 | Artifact | Files in `build/` | Producer | Jobs that download it |
 | --- | --- | --- | --- |
 | `guest-kernel` | `vmlinux`, `vmlinux.config`, `vmlinux.provenance.json` | `artifacts` | VMM tests, microVM tests, debug-kernel jobs, platform jobs |
 | `guest-alpine` | `initramfs.cpio.gz`, its `.packages.json`, `initramfs.provenance.json` | `artifacts` | VMM tests, microVM tests, debug-kernel jobs, platform jobs |
-| `guest-ubuntu` | `initramfs-ubuntu.cpio.gz` and its `.packages.json` | `artifacts` | microVM tests, platform jobs |
-| `guest-ubuntu-distro` | `ubuntu-distro.erofs` and its `.manifest.json` | `artifacts` | microVM tests, platform jobs |
-| `guest-ubuntu-scratch` | `ubuntu-smoke-scratch.ext4`, the sandbox scratch template | `artifacts` | microVM tests |
-| `guest-azurelinux` | `initramfs-azurelinux.cpio.gz` and its `.packages.json` | `artifacts` | microVM tests, platform jobs |
+| `guest-ubuntu` | `initramfs-ubuntu.cpio.gz` and its `.packages.json` | `distro-artifacts` | microVM tests, platform jobs |
+| `guest-ubuntu-distro` | `ubuntu-distro.erofs` and its `.manifest.json` | `distro-artifacts` | microVM tests, platform jobs |
+| `guest-ubuntu-scratch` | `ubuntu-smoke-scratch.ext4`, the sandbox scratch template | `distro-artifacts` | microVM tests |
+| `guest-azurelinux` | `initramfs-azurelinux.cpio.gz` and its `.packages.json` | `distro-artifacts` | microVM tests, platform jobs |
 | `guest-debug-kernel` | `vmlinux-debug`, `vmlinux-debug.config`, `vmlinux-debug.provenance.json` | `debug-kernel` | debug-kernel jobs |
 
 The OpenVMM VMM tests boot only the kernel and the Alpine initramfs. The
@@ -566,6 +575,23 @@ of these jobs to the guest files that it reads, through the `nvx.py` command
 or local action that it runs and the `build/` paths that it names, and fails
 when a job lacks a component that a step reads, downloads one that none
 reads, or waits for a guest artifact job that uploads none of its components.
+It also checks that each guest artifact job builds exactly the components
+that it uploads, and that no component builds in two jobs.
+
+Each job restores its components from their caches, and builds, verifies, and
+saves those that miss, as one job did before. The Ubuntu determinism check,
+the provenance that each build records, and the cache keys are unchanged. A
+cold `artifacts` job, with a warm kernel, takes about 1.3 minutes, so a miss
+of the Ubuntu or Azure Linux images, whose build and determinism check take
+about 4 minutes, no longer delays the VMM tests, which are the longest job of
+most runs that select them. `distro-artifacts` builds the base and guest-binary
+stages of the guest Docker build again, about 45 seconds of GitHub-hosted time,
+and its consumers wait for it about as long as they waited for the single guest
+artifact job before. From October 19 to 21, 2026, before the guest image keys
+covered only the guest binaries' inputs, 159 of 200 guest artifact jobs missed
+the cache, nearly all for the Alpine, Ubuntu, and Azure Linux images;
+[#703](https://github.com/microsoft/nvx/issues/703) records the measurements
+and how many of those misses the narrower keys remove.
 
 ## Change classification
 

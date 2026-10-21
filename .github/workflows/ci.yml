@@ -346,8 +346,12 @@ jobs:
           done
           grep -Ex '[a-z-]+=(true|false)' "${classification}" >> "${GITHUB_OUTPUT}"
 
+  # The kernel and the Alpine initramfs, which every job that boots a guest
+  # reads, build beside the Ubuntu and Azure Linux images, which only the
+  # microVM test and platform jobs read, so that a rebuild of those images
+  # delays neither the OpenVMM VMM tests nor the debug-kernel jobs.
   artifacts:
-    name: Build shared artifacts
+    name: Build kernel and Alpine artifacts
     needs: [openvmm-changes]
     if: >-
       ${{
@@ -376,6 +380,7 @@ jobs:
         id: guest-artifacts
         uses: ./.github/actions/build-guest-artifacts
         with:
+          components: kernel alpine
           save-cache: ${{ github.event_name == 'pull_request' || github.event_name == 'push' }}
 
       # One artifact per component, so that each job downloads only the
@@ -401,6 +406,39 @@ jobs:
             build/initramfs.provenance.json
           if-no-files-found: error
           retention-days: 1
+
+  distro-artifacts:
+    name: Build Ubuntu and Azure Linux artifacts
+    needs: [openvmm-changes]
+    if: >-
+      ${{
+        always() &&
+        !cancelled() &&
+        (
+          github.event_name != 'pull_request' ||
+          github.event.pull_request.draft == false
+        ) &&
+        (
+          needs.openvmm-changes.result != 'success' ||
+          needs.openvmm-changes.outputs.run-workloads == 'true'
+        )
+      }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v5
+        with:
+          persist-credentials: false
+
+      # Full runs build the guest artifacts that miss the cache without saving
+      # them.
+      - name: Build guest artifacts
+        id: guest-artifacts
+        uses: ./.github/actions/build-guest-artifacts
+        with:
+          components: ubuntu azurelinux
+          save-cache: ${{ github.event_name == 'pull_request' || github.event_name == 'push' }}
 
       - name: Upload Ubuntu initramfs
         uses: actions/upload-artifact@v7
@@ -1069,7 +1107,7 @@ jobs:
 
   nvx-microvm-tests-kvm:
     name: NVX microVM tests / Linux / KVM
-    needs: [artifacts, build-openvmm-linux-gnu, nvx-cli-linux, openvmm-changes]
+    needs: [artifacts, distro-artifacts, build-openvmm-linux-gnu, nvx-cli-linux, openvmm-changes]
     if: >-
       ${{
         always() &&
@@ -1083,6 +1121,7 @@ jobs:
           github.event.pull_request.head.repo.full_name == github.repository
         ) &&
         needs.artifacts.result == 'success' &&
+        needs.distro-artifacts.result == 'success' &&
         needs.build-openvmm-linux-gnu.result == 'success' &&
         needs.nvx-cli-linux.result == 'success' &&
         (
@@ -1102,7 +1141,7 @@ jobs:
 
   nvx-microvm-tests-mshv:
     name: NVX microVM tests / Linux / MSHV
-    needs: [artifacts, build-openvmm-linux-gnu, nvx-cli-linux, openvmm-changes]
+    needs: [artifacts, distro-artifacts, build-openvmm-linux-gnu, nvx-cli-linux, openvmm-changes]
     if: >-
       ${{
         always() &&
@@ -1116,6 +1155,7 @@ jobs:
           github.event.pull_request.head.repo.full_name == github.repository
         ) &&
         needs.artifacts.result == 'success' &&
+        needs.distro-artifacts.result == 'success' &&
         needs.build-openvmm-linux-gnu.result == 'success' &&
         needs.nvx-cli-linux.result == 'success' &&
         (
@@ -1135,7 +1175,7 @@ jobs:
 
   nvx-microvm-tests-whp:
     name: NVX microVM tests / Windows / WHP
-    needs: [artifacts, build-openvmm-windows-msvc, nvx-cli-windows, openvmm-changes]
+    needs: [artifacts, distro-artifacts, build-openvmm-windows-msvc, nvx-cli-windows, openvmm-changes]
     if: >-
       ${{
         always() &&
@@ -1149,6 +1189,7 @@ jobs:
           github.event.pull_request.head.repo.full_name == github.repository
         ) &&
         needs.artifacts.result == 'success' &&
+        needs.distro-artifacts.result == 'success' &&
         needs.build-openvmm-windows-msvc.result == 'success' &&
         needs.nvx-cli-windows.result == 'success' &&
         (
@@ -1267,7 +1308,7 @@ jobs:
   # run-to-run noise (#383, #415).
   platform-kvm:
     name: Platform / Linux / KVM / Virtual machine
-    needs: [artifacts, build-openvmm-linux-gnu, nvx-cli-linux, openvmm-changes]
+    needs: [artifacts, distro-artifacts, build-openvmm-linux-gnu, nvx-cli-linux, openvmm-changes]
     if: >-
       ${{
         always() &&
@@ -1281,6 +1322,7 @@ jobs:
           github.event.pull_request.head.repo.full_name == github.repository
         ) &&
         needs.artifacts.result == 'success' &&
+        needs.distro-artifacts.result == 'success' &&
         needs.build-openvmm-linux-gnu.result == 'success' &&
         needs.nvx-cli-linux.result == 'success' &&
         (
@@ -1307,7 +1349,7 @@ jobs:
 
   platform-mshv:
     name: Platform / Linux / MSHV / Virtual machine
-    needs: [artifacts, build-openvmm-linux-musl, nvx-cli-linux, openvmm-changes]
+    needs: [artifacts, distro-artifacts, build-openvmm-linux-musl, nvx-cli-linux, openvmm-changes]
     if: >-
       ${{
         always() &&
@@ -1321,6 +1363,7 @@ jobs:
           github.event.pull_request.head.repo.full_name == github.repository
         ) &&
         needs.artifacts.result == 'success' &&
+        needs.distro-artifacts.result == 'success' &&
         needs.build-openvmm-linux-musl.result == 'success' &&
         needs.nvx-cli-linux.result == 'success' &&
         (
@@ -1347,7 +1390,7 @@ jobs:
 
   platform-whp:
     name: Platform / Windows / WHP / Virtual machine
-    needs: [artifacts, build-openvmm-windows-msvc, nvx-cli-windows, openvmm-changes]
+    needs: [artifacts, distro-artifacts, build-openvmm-windows-msvc, nvx-cli-windows, openvmm-changes]
     if: >-
       ${{
         always() &&
@@ -1361,6 +1404,7 @@ jobs:
           github.event.pull_request.head.repo.full_name == github.repository
         ) &&
         needs.artifacts.result == 'success' &&
+        needs.distro-artifacts.result == 'success' &&
         needs.build-openvmm-windows-msvc.result == 'success' &&
         needs.nvx-cli-windows.result == 'success' &&
         (
@@ -1506,6 +1550,7 @@ jobs:
       - nvx-cli-windows
       - openvmm-changes
       - artifacts
+      - distro-artifacts
       - debug-kernel
       - build-openvmm-linux-gnu
       - build-openvmm-linux-musl
@@ -1551,6 +1596,7 @@ jobs:
           NVX_CLI_WINDOWS_RESULT: ${{ needs.nvx-cli-windows.result }}
           CHANGES_RESULT: ${{ needs.openvmm-changes.result }}
           ARTIFACTS_RESULT: ${{ needs.artifacts.result }}
+          DISTRO_ARTIFACTS_RESULT: ${{ needs.distro-artifacts.result }}
           DEBUG_KERNEL_RESULT: ${{ needs.debug-kernel.result }}
           BUILD_LINUX_GNU_RESULT: ${{ needs.build-openvmm-linux-gnu.result }}
           BUILD_LINUX_MUSL_RESULT: ${{ needs.build-openvmm-linux-musl.result }}

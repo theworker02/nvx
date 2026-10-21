@@ -38,6 +38,7 @@ REQUIRED_CI_RESULT_ENVIRONMENTS = {
     "nvx-cli-windows": "NVX_CLI_WINDOWS_RESULT",
     "openvmm-changes": "CHANGES_RESULT",
     "artifacts": "ARTIFACTS_RESULT",
+    "distro-artifacts": "DISTRO_ARTIFACTS_RESULT",
     "debug-kernel": "DEBUG_KERNEL_RESULT",
     "build-openvmm-linux-gnu": "BUILD_LINUX_GNU_RESULT",
     "build-openvmm-linux-musl": "BUILD_LINUX_MUSL_RESULT",
@@ -79,6 +80,9 @@ REQUIRED_CI_MICROVM_DEBUG_PUSH_JOBS = (
     "nvx-microvm-debug-whp",
 )
 REQUIRED_CI_ARTIFACT_JOB = "artifacts"
+# GitHub-hosted, beside the kernel and Alpine artifacts; only the microVM test
+# and platform jobs, which read the Ubuntu and Azure Linux images, wait for it.
+REQUIRED_CI_DISTRO_ARTIFACT_JOB = "distro-artifacts"
 # GitHub-hosted, beside the shared artifacts; only the debug jobs wait for it.
 REQUIRED_CI_DEBUG_KERNEL_JOB = "debug-kernel"
 REQUIRED_CI_PLATFORM_JOBS = (
@@ -304,6 +308,7 @@ def required_ci_expected_results(
         "nvx-rs": "success",
         "openvmm-changes": "success",
         REQUIRED_CI_ARTIFACT_JOB: "success" if run_workloads else "skipped",
+        REQUIRED_CI_DISTRO_ARTIFACT_JOB: "success" if run_workloads else "skipped",
         REQUIRED_CI_DEBUG_KERNEL_JOB: "success" if run_workloads else "skipped",
         "performance-gate": (
             "success"
