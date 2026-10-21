@@ -58,10 +58,19 @@ jobs:
       - name: Set up retrying curl
         uses: ./.github/actions/setup-curl
 
-      - name: Download guest artifacts
+      # The guest artifacts that the steps below boot or read. The debug-kernel
+      # jobs run only the Alpine scenarios on the debug kernel, and qualify the
+      # runner with the kernel and the Alpine initramfs.
+      - name: Download guest kernel
         uses: actions/download-artifact@v8
         with:
-          name: guest-artifacts
+          name: guest-kernel
+          path: build
+
+      - name: Download Alpine initramfs
+        uses: actions/download-artifact@v8
+        with:
+          name: guest-alpine
           path: build
 
       - name: Download guest debug kernel
@@ -69,6 +78,34 @@ jobs:
         uses: actions/download-artifact@v8
         with:
           name: guest-debug-kernel
+          path: build
+
+      - name: Download Ubuntu initramfs
+        if: ${{ !inputs.debug-kernel }}
+        uses: actions/download-artifact@v8
+        with:
+          name: guest-ubuntu
+          path: build
+
+      - name: Download Ubuntu distro layer
+        if: ${{ !inputs.debug-kernel }}
+        uses: actions/download-artifact@v8
+        with:
+          name: guest-ubuntu-distro
+          path: build
+
+      - name: Download Ubuntu sandbox scratch template
+        if: ${{ !inputs.debug-kernel }}
+        uses: actions/download-artifact@v8
+        with:
+          name: guest-ubuntu-scratch
+          path: build
+
+      - name: Download Azure Linux initramfs
+        if: ${{ !inputs.debug-kernel }}
+        uses: actions/download-artifact@v8
+        with:
+          name: guest-azurelinux
           path: build
 
       - name: Download OpenVMM executable

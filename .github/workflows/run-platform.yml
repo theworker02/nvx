@@ -87,10 +87,40 @@ jobs:
         shell: powershell
         run: python scripts\nvx.py verify
 
-      - name: Download guest artifacts
+      # The runner qualification and the benchmarks boot the kernel and the
+      # Alpine initramfs; the release package also ships the Ubuntu and Azure
+      # Linux images.
+      - name: Download guest kernel
         uses: actions/download-artifact@v8
         with:
-          name: guest-artifacts
+          name: guest-kernel
+          path: build
+
+      - name: Download Alpine initramfs
+        uses: actions/download-artifact@v8
+        with:
+          name: guest-alpine
+          path: build
+
+      - name: Download Ubuntu initramfs
+        if: inputs.package-release
+        uses: actions/download-artifact@v8
+        with:
+          name: guest-ubuntu
+          path: build
+
+      - name: Download Ubuntu distro layer
+        if: inputs.package-release
+        uses: actions/download-artifact@v8
+        with:
+          name: guest-ubuntu-distro
+          path: build
+
+      - name: Download Azure Linux initramfs
+        if: inputs.package-release
+        uses: actions/download-artifact@v8
+        with:
+          name: guest-azurelinux
           path: build
 
       - name: Download OpenVMM executable

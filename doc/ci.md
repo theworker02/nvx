@@ -14,8 +14,9 @@ its performance series on the same VM
 (see [Benchmarks](benchmarks.md#ci-collection)). Before it measures, each
 platform job also checks that its runner is still the host that the series'
 history comes from (see
-[Expected benchmark hosts](benchmarks.md#expected-benchmark-hosts)). `openvmm-vmm-tests` downloads the NVX
-guest artifacts and uses the Linux-direct kernel and Alpine initramfs to
+[Expected benchmark hosts](benchmarks.md#expected-benchmark-hosts)). `openvmm-vmm-tests` downloads only the NVX
+Linux-direct kernel and Alpine initramfs (see
+[Guest artifact handoff](#guest-artifact-handoff)) and uses them to
 exercise OpenVMM's Linux MP-table lifecycle, TTRPC, and snapshot contracts on
 each backend. `openvmm-unit-tests` runs the OpenVMM unit and documentation
 tests once per operating system, on a GitHub-hosted Ubuntu runner and a WHP
@@ -267,8 +268,9 @@ A change to the host side or a test of `nvx-rs` therefore rebuilds no guest
 image, and a change to any file that a guest binary compiles rebuilds them
 all. Ubuntu keys also include the Canonical archive pin, supplemental
 package lock, common guest sources, shared download and guest descriptor
-modules, and converter implementation. Artifact upload
-retains the Alpine filenames and adds the distinct Ubuntu filenames. Each
+modules, and converter implementation. Each component is handed to the jobs
+that read it as a workflow artifact of its own, under its build filenames (see
+[Guest artifact handoff](#guest-artifact-handoff)). Each
 backend also boots the Ubuntu initramfs and runs
 `/sbin/nvx-sandbox-smoke` from the Ubuntu EROFS layer as UID/GID 65534 over a
 fresh ext4 scratch copy, with a 32 MiB `--memory-max` and an 8-process
@@ -531,6 +533,39 @@ still 13% with a warm sccache, which would take over 2 GiB of the repository's
 10 GB Actions cache, already full. Larger GitHub-hosted runners, which public
 repositories pay for, or a self-hosted Windows runner without a hypervisor
 would cost about as much as another general WHP runner.
+
+## Guest artifact handoff
+
+The guest artifact jobs restore or build their components with the
+[`build-guest-artifacts`](../.github/actions/build-guest-artifacts/action.yml)
+action, whose `components` input selects them, and upload each component as a
+one-day workflow artifact of its own. Each job that boots or reads guest
+artifacts downloads, by name and into `build/`, only the components that its
+steps read, and waits for the jobs that upload them:
+
+| Artifact | Files in `build/` | Producer | Jobs that download it |
+| --- | --- | --- | --- |
+| `guest-kernel` | `vmlinux`, `vmlinux.config`, `vmlinux.provenance.json` | `artifacts` | VMM tests, microVM tests, debug-kernel jobs, platform jobs |
+| `guest-alpine` | `initramfs.cpio.gz`, its `.packages.json`, `initramfs.provenance.json` | `artifacts` | VMM tests, microVM tests, debug-kernel jobs, platform jobs |
+| `guest-ubuntu` | `initramfs-ubuntu.cpio.gz` and its `.packages.json` | `artifacts` | microVM tests, platform jobs |
+| `guest-ubuntu-distro` | `ubuntu-distro.erofs` and its `.manifest.json` | `artifacts` | microVM tests, platform jobs |
+| `guest-ubuntu-scratch` | `ubuntu-smoke-scratch.ext4`, the sandbox scratch template | `artifacts` | microVM tests |
+| `guest-azurelinux` | `initramfs-azurelinux.cpio.gz` and its `.packages.json` | `artifacts` | microVM tests, platform jobs |
+| `guest-debug-kernel` | `vmlinux-debug`, `vmlinux-debug.config`, `vmlinux-debug.provenance.json` | `debug-kernel` | debug-kernel jobs |
+
+The OpenVMM VMM tests boot only the kernel and the Alpine initramfs. The
+debug-kernel jobs run the Alpine scenarios on the debug kernel and qualify
+their runner, through the doctor's preflight (H3), with the kernel and the
+Alpine initramfs. The microVM test jobs boot every guest and run sandboxes
+from the Ubuntu distro layer over copies of the scratch template. The platform
+jobs boot the kernel and the Alpine initramfs to qualify their runner and to
+benchmark, and package every guest image but the scratch template into their
+release. A missing artifact fails its download step, so no job runs without a
+component that it reads. A test in `scripts/test_nvx_tools.py` maps each step
+of these jobs to the guest files that it reads, through the `nvx.py` command
+or local action that it runs and the `build/` paths that it names, and fails
+when a job lacks a component that a step reads, downloads one that none
+reads, or waits for a guest artifact job that uploads none of its components.
 
 ## Change classification
 

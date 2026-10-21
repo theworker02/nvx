@@ -378,24 +378,65 @@ jobs:
         with:
           save-cache: ${{ github.event_name == 'pull_request' || github.event_name == 'push' }}
 
-      - name: Upload guest artifacts
+      # One artifact per component, so that each job downloads only the
+      # components that it reads (doc/ci.md, "Guest artifact handoff").
+      - name: Upload guest kernel
         uses: actions/upload-artifact@v7
         with:
-          name: guest-artifacts
+          name: guest-kernel
           path: |
             build/vmlinux
             build/vmlinux.config
             build/vmlinux.provenance.json
+          if-no-files-found: error
+          retention-days: 1
+
+      - name: Upload Alpine initramfs
+        uses: actions/upload-artifact@v7
+        with:
+          name: guest-alpine
+          path: |
             build/initramfs.cpio.gz
             build/initramfs.cpio.gz.packages.json
             build/initramfs.provenance.json
+          if-no-files-found: error
+          retention-days: 1
+
+      - name: Upload Ubuntu initramfs
+        uses: actions/upload-artifact@v7
+        with:
+          name: guest-ubuntu
+          path: |
             build/initramfs-ubuntu.cpio.gz
             build/initramfs-ubuntu.cpio.gz.packages.json
-            build/initramfs-azurelinux.cpio.gz
-            build/initramfs-azurelinux.cpio.gz.packages.json
+          if-no-files-found: error
+          retention-days: 1
+
+      - name: Upload Ubuntu distro layer
+        uses: actions/upload-artifact@v7
+        with:
+          name: guest-ubuntu-distro
+          path: |
             build/ubuntu-distro.erofs
             build/ubuntu-distro.erofs.manifest.json
-            build/ubuntu-smoke-scratch.ext4
+          if-no-files-found: error
+          retention-days: 1
+
+      - name: Upload Ubuntu sandbox scratch template
+        uses: actions/upload-artifact@v7
+        with:
+          name: guest-ubuntu-scratch
+          path: build/ubuntu-smoke-scratch.ext4
+          if-no-files-found: error
+          retention-days: 1
+
+      - name: Upload Azure Linux initramfs
+        uses: actions/upload-artifact@v7
+        with:
+          name: guest-azurelinux
+          path: |
+            build/initramfs-azurelinux.cpio.gz
+            build/initramfs-azurelinux.cpio.gz.packages.json
           if-no-files-found: error
           retention-days: 1
 
@@ -591,10 +632,17 @@ jobs:
       - name: Set up retrying curl
         uses: ./.github/actions/setup-curl
 
-      - name: Download guest artifacts
+      # The VMM tests boot only the kernel and the Alpine initramfs.
+      - name: Download guest kernel
         uses: actions/download-artifact@v8
         with:
-          name: guest-artifacts
+          name: guest-kernel
+          path: build
+
+      - name: Download Alpine initramfs
+        uses: actions/download-artifact@v8
+        with:
+          name: guest-alpine
           path: build
 
       - name: Prepare Windows cache tools

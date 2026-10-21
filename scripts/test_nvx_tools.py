@@ -31,7 +31,7 @@ import uuid
 import zipfile
 from collections.abc import Callable, Generator, Mapping
 from pathlib import Path, PurePosixPath
-from typing import cast
+from typing import Any, cast
 from unittest.mock import MagicMock, call, patch
 
 import yaml
@@ -71,6 +71,7 @@ from nvx_tools.build_constants import (  # noqa: E402
     UbuntuBuildConstants,
     ZstdBuildConstants,
 )
+from nvx_tools.microvm_tests import PUBLIC_SANDBOX_SCENARIOS  # noqa: E402
 from nvx_tools.time_abi import (  # noqa: E402
     CPU_GENERATIONS,
     OPENVMM_CPU_PROFILES,
@@ -3652,6 +3653,316 @@ class CiConfigurationTests(unittest.TestCase):
                 self.assertIn(f"      - {job}\n", required)
                 self.assertIn(f"${{{{ needs.{job}.result }}}}", required)
 
+    def test_ci_jobs_download_exactly_the_guest_artifacts_that_they_read(self):
+        # Each guest artifact component is its own workflow artifact. A job
+        # that reads any file of a component must download that component and
+        # wait for the job that uploads it, so no job lacks an artifact that it
+        # boots, and a job downloads and waits for nothing else.
+        github = BuildConstants.REPO_ROOT / ".github"
+
+        def load(name: str) -> Any:
+            return yaml.safe_load(
+                (github / "workflows" / name).read_text(encoding="utf-8")
+            )
+
+        jobs: dict[str, dict[str, Any]] = load("ci.yml")["jobs"]
+        scratch = "ubuntu-smoke-scratch.ext4"
+        components = {
+            "guest-kernel": {
+                KernelBuildConstants.BINARY_NAME,
+                KernelBuildConstants.CONFIG_NAME,
+                KernelBuildConstants.PROVENANCE_NAME,
+            },
+            "guest-alpine": {
+                AlpineBuildConstants.INITRAMFS_NAME,
+                AlpineBuildConstants.PACKAGE_MANIFEST_NAME,
+                InitramfsBuildConstants.PROVENANCE_NAME,
+            },
+            "guest-ubuntu": {
+                UbuntuBuildConstants.INITRAMFS_NAME,
+                UbuntuBuildConstants.PACKAGE_MANIFEST_NAME,
+            },
+            "guest-ubuntu-distro": {
+                UbuntuBuildConstants.DISTRO_NAME,
+                UbuntuBuildConstants.DISTRO_MANIFEST_NAME,
+            },
+            "guest-ubuntu-scratch": {scratch},
+            "guest-azurelinux": {
+                AzureLinuxBuildConstants.INITRAMFS_NAME,
+                AzureLinuxBuildConstants.PACKAGE_MANIFEST_NAME,
+            },
+            "guest-debug-kernel": set(DockerBuildConstants.DEBUG_KERNEL_ARTIFACT_NAMES),
+        }
+        guest_files = set[str]().union(*components.values())
+        # Every file that the guest builds produce is handed over.
+        self.assertEqual(
+            guest_files,
+            {
+                *DockerBuildConstants.ALL_GUEST_ARTIFACT_NAMES,
+                *DockerBuildConstants.DEBUG_KERNEL_ARTIFACT_NAMES,
+                scratch,
+            },
+        )
+
+        producers: dict[str, str] = {}
+        for job_name, job in jobs.items():
+            for step in job.get("steps", []):
+                arguments = step.get("with", {})
+                if not str(step.get("uses", "")).startswith(
+                    "actions/upload-artifact@"
+                ) or not str(arguments.get("name")).startswith("guest-"):
+                    continue
+                name = arguments["name"]
+                with self.subTest(upload=name):
+                    self.assertNotIn(name, producers)
+                    producers[name] = job_name
+                    paths = str(arguments["path"]).split()
+                    self.assertTrue(all(path.startswith("build/") for path in paths))
+                    self.assertEqual(
+                        {PurePosixPath(path).name for path in paths}, components[name]
+                    )
+                    self.assertEqual(arguments["if-no-files-found"], "error")
+        self.assertEqual(set(producers), set(components))
+
+        kernel_alpine = {
+            KernelBuildConstants.BINARY_NAME,
+            AlpineBuildConstants.INITRAMFS_NAME,
+        }
+        # The public sandbox scenarios run workloads from the Ubuntu layer
+        # (managed_exec_tests.load_workload_artifacts).
+        workload = {
+            UbuntuBuildConstants.DISTRO_NAME,
+            UbuntuBuildConstants.DISTRO_MANIFEST_NAME,
+            scratch,
+        }
+        release_files = {
+            *ReleaseBuildConstants.GUEST_ARTIFACT_NAMES,
+            KernelBuildConstants.PROVENANCE_NAME,
+            InitramfsBuildConstants.PROVENANCE_NAME,
+        }
+        actions = {
+            "./.github/actions/checkout-openvmm": set[str](),
+            "./.github/actions/setup-curl": set[str](),
+            "./.github/actions/sccache": set[str](),
+            # The doctor's preflight (H3) and guest warp probe (H6) boot its
+            # default kernel and initramfs.
+            "./.github/actions/validate-runner": kernel_alpine,
+            "./.github/actions/run-benchmark": kernel_alpine,
+            "./.github/actions/package-release": release_files,
+        }
+        # nvx.py commands, which boot the kernel and the Alpine initramfs
+        # unless test-microvm selects another guest or the debug kernel.
+        commands = {
+            "setup-cross-os-cache": set[str](),
+            "verify": set[str](),
+            "test-openvmm": kernel_alpine,
+            "test-aci-edge-sandboxes": kernel_alpine,
+            # A sandbox boots the Alpine control initramfs under its layers.
+            "sandbox": kernel_alpine,
+        }
+
+        def reads(step: dict[str, Any], context: Mapping[str, object]) -> set[str]:
+            uses = str(step.get("uses", ""))
+            if uses.startswith("./"):
+                self.assertIn(uses, actions)
+                if (
+                    uses == "./.github/actions/validate-runner"
+                    and step.get("with", {}).get("verify-openvmm") != "true"
+                ):
+                    return set()
+                return actions[uses]
+            if uses:
+                self.assertTrue(uses.startswith("actions/"), uses)
+                return set()
+            script = str(step["run"])
+            files = {
+                name
+                for name in re.findall(r"\bbuild[/\\]([\w.-]+)", script)
+                if name in guest_files
+            }
+            for command in re.findall(
+                r"(?:nvx\.py|Invoke-Nvx)\s+([a-z][a-z-]*)", script
+            ):
+                if command == "test-microvm":
+                    guest = re.search(r"--guest (\S+)", script)
+                    files.add(
+                        guests.guest_descriptor(
+                            guest.group(1) if guest else "alpine"
+                        ).initramfs_name
+                    )
+                    if "inputs.debug-kernel && '--debug-kernel'" in script:
+                        debug = context["inputs.debug-kernel"] is True
+                    else:
+                        debug = "--debug-kernel" in script
+                    files |= (
+                        {
+                            KernelBuildConstants.DEBUG_BINARY_NAME,
+                            KernelBuildConstants.DEBUG_CONFIG_NAME,
+                        }
+                        if debug
+                        else {KernelBuildConstants.BINARY_NAME}
+                    )
+                    scenarios = set(re.findall(r"--scenario (\S+)", script))
+                    if scenarios & PUBLIC_SANDBOX_SCENARIOS:
+                        files |= workload
+                else:
+                    self.assertIn(command, commands)
+                    files |= commands[command]
+            # The runtime adapter's hypervisor scenarios boot what nvx finds.
+            if "cargo test" in script:
+                files |= kernel_alpine
+            return files
+
+        def holds(condition: object, context: Mapping[str, object]) -> bool:
+            # The conjunctions of atoms that the steps that read or download
+            # guest artifacts use; anything else fails the test.
+            for term in _expression_conjuncts(str(condition or "true")):
+                if term == "true":
+                    continue
+                match = re.fullmatch(
+                    r"(!?)\s*([\w.-]+)(?:\s*(==|!=)\s*'([^']*)')?", term
+                )
+                self.assertIsNotNone(match, term)
+                assert match is not None
+                negated, name, operator, literal = match.groups()
+                value = context[name]
+                result = (
+                    bool(value)
+                    if operator is None
+                    else (str(value) == literal) == (operator == "==")
+                )
+                if result == bool(negated):
+                    return False
+            return True
+
+        def consume(
+            steps: list[dict[str, Any]], context: Mapping[str, object]
+        ) -> tuple[set[str], set[str]] | None:
+            # The guest artifacts that a job downloads and the guest files that
+            # its steps read, or None if it downloads none; such a job reads
+            # none from its build directory either.
+            downloads: set[str] = set()
+            for step in steps:
+                arguments = step.get("with", {})
+                if str(step.get("uses", "")).startswith(
+                    "actions/download-artifact@"
+                ) and str(arguments.get("name", arguments.get("pattern"))).startswith(
+                    "guest-"
+                ):
+                    self.assertNotIn("pattern", arguments)
+                    self.assertEqual(arguments["path"], "build")
+                    if holds(step.get("if"), context):
+                        downloads.add(arguments["name"])
+            if not downloads:
+                return None
+            read: set[str] = set()
+            for step in steps:
+                if str(step.get("uses", "")).startswith("actions/download-artifact@"):
+                    continue
+                files = reads(step, context)
+                if files and holds(step.get("if"), context):
+                    read |= files
+            return downloads, read
+
+        consumers: set[str] = set()
+        for job_name, job in jobs.items():
+            callee = str(job.get("uses", ""))
+            if callee.startswith("./.github/workflows/"):
+                workflow = load(callee.removeprefix("./.github/workflows/"))
+                triggers = workflow.get(True, workflow.get("on"))
+                inputs = {
+                    **{
+                        name: definition.get("default")
+                        for name, definition in triggers["workflow_call"][
+                            "inputs"
+                        ].items()
+                    },
+                    **job.get("with", {}),
+                }
+                contexts: list[dict[str, object]] = [
+                    {
+                        "runner.os": (
+                            "Windows"
+                            if "windows" in json.loads(inputs["runner"])
+                            else "Linux"
+                        ),
+                        **{f"inputs.{name}": value for name, value in inputs.items()},
+                    }
+                ]
+                steps = [
+                    step
+                    for definition in workflow["jobs"].values()
+                    for step in definition["steps"]
+                ]
+            else:
+                legs = job.get("strategy", {}).get("matrix", {}).get("include", [{}])
+                contexts = [
+                    {
+                        "runner.os": (
+                            "Windows"
+                            if "windows" in json.loads(leg.get("runner", "[]"))
+                            else "Linux"
+                        ),
+                        **{f"matrix.{name}": value for name, value in leg.items()},
+                    }
+                    for leg in legs
+                ]
+                steps = job.get("steps", [])
+            for context in contexts:
+                downloads = consume(steps, context)
+                if downloads is None:
+                    continue
+                consumers.add(job_name)
+                downloaded, read = downloads
+                expected = {name for name, files in components.items() if files & read}
+                with self.subTest(job=job_name, context=context):
+                    self.assertEqual(downloaded, expected)
+                    needs = job.get("needs", [])
+                    needs = [needs] if isinstance(needs, str) else needs
+                    self.assertEqual(
+                        set(needs) & set(producers.values()),
+                        {producers[name] for name in expected},
+                    )
+                    for producer in {producers[name] for name in expected}:
+                        self.assertIn(
+                            f"needs.{producer}.result == 'success'",
+                            _expression_conjuncts(str(job["if"])),
+                        )
+        self.assertEqual(
+            consumers,
+            {
+                "openvmm-vmm-tests",
+                *ci.REQUIRED_CI_MICROVM_TEST_JOBS,
+                *ci.REQUIRED_CI_MICROVM_DEBUG_JOBS,
+                *ci.REQUIRED_CI_MICROVM_DEBUG_PUSH_JOBS,
+                *ci.REQUIRED_CI_PLATFORM_JOBS,
+            },
+        )
+
+        # test-openvmm boots the kernel and the Alpine initramfs.
+        requested: list[str] = []
+
+        class Stop(Exception):
+            pass
+
+        def artifact(name: str) -> Path:
+            requested.append(name)
+            return Path(name)
+
+        def present(path: Path, _description: str) -> Path:
+            return path
+
+        with (
+            patch.object(ci, "validate_openvmm_test_backend"),
+            patch.object(ci, "require_file", side_effect=present),
+            patch.object(ci, "require_tool", return_value="tool"),
+            patch.object(ci, "artifact_path", side_effect=artifact),
+            patch.object(ci, "_prepare_openvmm_test_environment", side_effect=Stop),
+            self.assertRaises(Stop),
+        ):
+            ci.run_openvmm_tests("kvm")
+        self.assertEqual(set(requested), commands["test-openvmm"])
+
     def test_development_release_requires_successful_crate_checks(self):
         workflow = (
             BuildConstants.REPO_ROOT / ".github" / "workflows" / "ci.yml"
@@ -5267,10 +5578,11 @@ python3() {
         self.assertEqual(build_workflow.count("overwrite: true"), 2)
         self.assertEqual(build_workflow.count("retention-days: 1"), 2)
         # The microVM workflow also downloads nvx-rs, which the benchmarks
-        # don't run.
+        # don't run, and the Ubuntu sandbox scratch template and the debug
+        # kernel, which the platform jobs don't read.
         for consumer_workflow, download_count in (
-            (microvm_workflow, 5),
-            (platform_workflow, 3),
+            (microvm_workflow, 10),
+            (platform_workflow, 7),
         ):
             self.assertIn("path: openvmm/target/release", consumer_workflow)
             self.assertIn("path: build", consumer_workflow)
@@ -6568,7 +6880,8 @@ python3() {
                     workflow_name == "run-platform.yml",
                 )
                 for step in (
-                    "      - name: Download guest artifacts\n",
+                    "      - name: Download guest kernel\n",
+                    "      - name: Download Alpine initramfs\n",
                     "      - name: Download OpenVMM executable\n",
                     "      - name: Make OpenVMM executable\n",
                 ):
@@ -11151,9 +11464,23 @@ class BuildTests(unittest.TestCase):
         openvmm_tests = _workflow_job(workflow, "openvmm-vmm-tests")
         self.assertIn("needs: [artifacts, openvmm-changes]", openvmm_tests)
         self.assertIn("needs.artifacts.result == 'success'", openvmm_tests)
-        self.assertIn("- name: Download guest artifacts", openvmm_tests)
-        self.assertIn("name: guest-artifacts", openvmm_tests)
-        self.assertIn("path: build", openvmm_tests)
+        # The VMM tests boot only the kernel and the Alpine initramfs.
+        self.assertEqual(
+            re.findall(
+                r"^      - name: (Download .+)\n"
+                r"        uses: actions/download-artifact@v8\n"
+                r"        with:\n"
+                r"          name: (\S+)\n"
+                r"          path: build$",
+                openvmm_tests,
+                re.MULTILINE,
+            ),
+            [
+                ("Download guest kernel", "guest-kernel"),
+                ("Download Alpine initramfs", "guest-alpine"),
+            ],
+        )
+        self.assertNotIn("guest-artifacts", openvmm_tests)
         self.assertIn("openvmm-vmm-tests", ci.REQUIRED_CI_OPENVMM_ARTIFACT_TEST_JOBS)
 
     def test_apk_add_uses_host_ca_bundle_without_overriding_configuration(self):
