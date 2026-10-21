@@ -19,11 +19,11 @@ use std::process::{Child, Command};
 use std::thread;
 use std::time::Duration;
 
-use super::args::{Parser, Receiver, Spec, Syntax, invalid_choice, invalid_value};
+use super::args::{Parser, Receiver, Spec, Syntax, choice, integer, invalid_value};
 use super::artifacts::{Located, locate};
+use super::network::NetworkOptions;
 use super::{Exit, Result, output};
 use crate::host::artifacts::{Guest, KERNEL_NAME};
-use crate::host::network::policy::compile_policy_file;
 use crate::host::platform;
 use crate::host::python::builtins::{Int, parse_float};
 use crate::host::python::path::PurePath;
@@ -172,13 +172,9 @@ options:
 /// The operations, in the order in which usage messages list them.
 const OPERATIONS: [&str; 6] = ["run", "provision", "start", "exec", "stop", "deprovision"];
 /// The choices of `--hypervisor`.
-const HYPERVISORS: [&str; 4] = ["auto", "whp", "kvm", "mshv"];
+pub(super) const HYPERVISORS: [&str; 4] = ["auto", "whp", "kvm", "mshv"];
 /// The choices of `--mount-owner`.
-const MOUNT_OWNERS: [&str; 2] = ["vmm", "caller"];
-/// The choices of `--network-profile`.
-const NETWORK_PROFILES: [&str; 1] = ["portable"];
-/// The choices of `--network-egress`, `--network-ingress`, and `--host-loopback`.
-const ACCESS: [&str; 2] = ["allow", "deny"];
+pub(super) const MOUNT_OWNERS: [&str; 2] = ["vmm", "caller"];
 
 /// The options of `nvx-rs sandbox`, which parse with the defaults of `nvx.py sandbox`.
 const OPTIONS: [Spec; 35] = [
@@ -265,26 +261,8 @@ pub(crate) struct Options {
     pub(crate) policy_paths: Vec<PolicyPathOption>,
     /// `--mount-owner`.
     pub(crate) mount_owner: Option<MountOwner>,
-    /// `--net`.
-    pub(crate) net: Option<String>,
-    /// `--network-profile`.
-    pub(crate) network_profile: Option<&'static str>,
-    /// `--network-egress`.
-    pub(crate) network_egress: Option<&'static str>,
-    /// `--network-ingress`.
-    pub(crate) network_ingress: Option<&'static str>,
-    /// The `--network-egress-allow` options.
-    pub(crate) network_egress_allow: Vec<String>,
-    /// The `--network-egress-deny` options.
-    pub(crate) network_egress_deny: Vec<String>,
-    /// `--network-egress-policy-file`, as given.
-    pub(crate) network_egress_policy_file: Option<String>,
-    /// `--host-loopback`.
-    pub(crate) host_loopback: Option<&'static str>,
-    /// `--network-proxy`.
-    pub(crate) network_proxy: Option<String>,
-    /// The `--host-loopback-forward` options.
-    pub(crate) host_loopback_forward: Vec<String>,
+    /// The network options.
+    pub(crate) network: NetworkOptions,
     /// `--outcome-report`, as given.
     pub(crate) outcome_report: Option<String>,
     /// `--cmdline`, empty by default.
@@ -317,35 +295,12 @@ impl Default for Options {
             mounts: Vec::new(),
             policy_paths: Vec::new(),
             mount_owner: None,
-            net: None,
-            network_profile: None,
-            network_egress: None,
-            network_ingress: None,
-            network_egress_allow: Vec::new(),
-            network_egress_deny: Vec::new(),
-            network_egress_policy_file: None,
-            host_loopback: None,
-            network_proxy: None,
-            host_loopback_forward: Vec::new(),
+            network: NetworkOptions::default(),
             outcome_report: None,
             cmdline: String::new(),
             dry_run: false,
         }
     }
-}
-
-/// Returns the choice that `value` names among `choices`, as `argparse` checks `choices`.
-fn choice(value: &str, choices: &[&'static str]) -> std::result::Result<&'static str, String> {
-    choices
-        .iter()
-        .find(|choice| **choice == value)
-        .copied()
-        .ok_or_else(|| invalid_choice(value, choices))
-}
-
-/// Returns `int(value)` for an option of `type=int`.
-fn integer(value: &str) -> std::result::Result<Int, String> {
-    Int::parse(value).map_err(|_| invalid_value("int", value))
 }
 
 impl Receiver for Options {
@@ -411,20 +366,10 @@ impl Receiver for Options {
                     _ => MountOwner::Vmm,
                 });
             }
-            "--net" => self.net = Some(text()),
-            "--network-profile" => self.network_profile = Some(choice(&text(), &NETWORK_PROFILES)?),
-            "--network-egress" => self.network_egress = Some(choice(&text(), &ACCESS)?),
-            "--network-ingress" => self.network_ingress = Some(choice(&text(), &ACCESS)?),
-            "--network-egress-allow" => self.network_egress_allow.push(text()),
-            "--network-egress-deny" => self.network_egress_deny.push(text()),
-            "--network-egress-policy-file" => self.network_egress_policy_file = Some(text()),
-            "--host-loopback" => self.host_loopback = Some(choice(&text(), &ACCESS)?),
-            "--network-proxy" => self.network_proxy = Some(text()),
-            "--host-loopback-forward" => self.host_loopback_forward.push(text()),
             "--outcome-report" => self.outcome_report = Some(text()),
             "--cmdline" => self.cmdline = text(),
             "--dry-run" => self.dry_run = true,
-            _ => unreachable!("the parser knows only these options"),
+            _ => return self.network.take(name, &text()),
         }
         Ok(())
     }
@@ -441,7 +386,7 @@ pub(super) fn parse(arguments: &[String], program: &str) -> Result<(Options, Vec
 }
 
 /// Returns `_hypervisor(selected)`: `auto` selects `whp` on Windows and `kvm` elsewhere.
-fn hypervisor(selected: &'static str) -> &'static str {
+pub(super) fn hypervisor(selected: &'static str) -> &'static str {
     match selected {
         "auto" if cfg!(windows) => "whp",
         "auto" => "kvm",
@@ -450,7 +395,7 @@ fn hypervisor(selected: &'static str) -> &'static str {
 }
 
 /// Returns `str(Path(value))`.
-fn path_text(value: &str) -> String {
+pub(super) fn path_text(value: &str) -> String {
     PurePath::native(value).as_str().to_owned()
 }
 
@@ -459,78 +404,6 @@ pub(crate) fn path_string(path: &std::path::Path) -> Result<String> {
     path.to_str()
         .map(str::to_owned)
         .ok_or_else(|| Exit::error(format!("path is not valid Unicode: {}", path.display())))
-}
-
-/// The rules of the egress policy of a launch.
-struct EgressRules {
-    /// The `--network-egress-allow` rules.
-    allow: Vec<String>,
-    /// The `--network-egress-deny` rules.
-    deny: Vec<String>,
-}
-
-/// Returns `_resolve_network_egress_rules(args)`: the explicit rules, or those that the
-/// `--network-egress-policy-file` compiles to, which neither rule option nor a missing
-/// `--network-egress` may accompany.
-fn resolve_network_egress_rules(options: &Options) -> Result<EgressRules> {
-    let Some(policy) = &options.network_egress_policy_file else {
-        return Ok(EgressRules {
-            allow: options.network_egress_allow.clone(),
-            deny: options.network_egress_deny.clone(),
-        });
-    };
-    if !options.network_egress_allow.is_empty() || !options.network_egress_deny.is_empty() {
-        return Err(Exit::error(
-            "--network-egress-policy-file cannot be combined with --network-egress-allow or \
-             --network-egress-deny",
-        ));
-    }
-    if options.network_egress.is_none() {
-        return Err(Exit::error(
-            "--network-egress is required with --network-egress-policy-file",
-        ));
-    }
-    let compiled = compile_policy_file(std::path::Path::new(policy))?;
-    Ok(EgressRules {
-        allow: compiled.allow,
-        deny: compiled.deny,
-    })
-}
-
-/// Appends the network options of `options` to `command`, as `_extend_network_arguments` does.
-fn extend_network_arguments(command: &mut Vec<String>, options: &Options, rules: &EgressRules) {
-    let mut push = |name: &str, value: &str| {
-        command.push(name.to_owned());
-        command.push(value.to_owned());
-    };
-    if let Some(net) = &options.net {
-        push("--net", net);
-        push(
-            "--network-profile",
-            options.network_profile.unwrap_or_default(),
-        );
-    }
-    if let Some(egress) = options.network_egress {
-        push("--network-egress", egress);
-    }
-    if let Some(ingress) = options.network_ingress {
-        push("--network-ingress", ingress);
-    }
-    for rule in &rules.allow {
-        push("--network-egress-allow", rule);
-    }
-    for rule in &rules.deny {
-        push("--network-egress-deny", rule);
-    }
-    if let Some(host_loopback) = options.host_loopback {
-        push("--host-loopback", host_loopback);
-    }
-    if let Some(proxy) = &options.network_proxy {
-        push("--network-proxy", proxy);
-    }
-    for forward in &options.host_loopback_forward {
-        push("--host-loopback-forward", forward);
-    }
 }
 
 /// The artifacts of a sandbox, found when an operation first needs them.
@@ -567,18 +440,9 @@ pub(super) fn run(root: Option<&str>, options: Options) -> Result {
         environment: options.environment.clone(),
         environment_file: options.environment_file.clone(),
         inherit_default_environment: options.inherit_default_environment,
-        network_options: options.net.is_some()
-            || options.network_profile.is_some()
-            || options.network_egress.is_some()
-            || options.network_ingress.is_some()
-            || options.network_egress_policy_file.is_some()
-            || options.host_loopback.is_some()
-            || options.network_proxy.is_some()
-            || !options.network_egress_allow.is_empty()
-            || !options.network_egress_deny.is_empty()
-            || !options.host_loopback_forward.is_empty(),
-        net: options.net.is_some(),
-        network_profile: options.network_profile.is_some(),
+        network_options: options.network.any(),
+        net: options.network.net.is_some(),
+        network_profile: options.network.network_profile.is_some(),
         entrypoint: options.entrypoint.clone(),
         outcome_report: options.outcome_report.is_some(),
         mounts: options.mounts.clone(),
@@ -592,7 +456,7 @@ pub(super) fn run(root: Option<&str>, options: Options) -> Result {
         operation,
         SandboxOperation::Run | SandboxOperation::Provision
     ) {
-        let rules = resolve_network_egress_rules(&options)?;
+        let rules = options.network.egress_rules()?;
         let mounts = sandbox_mounts(&options.mounts, &options.policy_paths, options.mount_owner)?;
         let settings = SandboxSettings {
             entrypoint: options.entrypoint.clone(),
@@ -624,21 +488,22 @@ pub(super) fn run(root: Option<&str>, options: Options) -> Result {
     match (operation, launch) {
         (SandboxOperation::Provision, Some((launch, rules))) => {
             let state_dir = state_dir("provision")?;
+            let network = &options.network;
             lifecycle::provision(
                 state_dir,
                 &launch,
                 &ProvisionConfig {
                     hypervisor: hypervisor(options.hypervisor),
                     memory_mib: &options.memory_mib,
-                    net: options.net.as_deref(),
-                    network_profile: options.network_profile,
-                    network_egress: options.network_egress,
-                    network_ingress: options.network_ingress,
+                    net: network.net.as_deref(),
+                    network_profile: network.network_profile,
+                    network_egress: network.network_egress,
+                    network_ingress: network.network_ingress,
                     network_egress_allow: &rules.allow,
                     network_egress_deny: &rules.deny,
-                    host_loopback: options.host_loopback,
-                    network_proxy: options.network_proxy.as_deref(),
-                    host_loopback_forward: &options.host_loopback_forward,
+                    host_loopback: network.host_loopback,
+                    network_proxy: network.network_proxy.as_deref(),
+                    host_loopback_forward: &network.host_loopback_forward,
                     cmdline: &options.cmdline,
                 },
                 options.timeout,
@@ -708,7 +573,7 @@ pub(super) fn run(root: Option<&str>, options: Options) -> Result {
                 "--cmdline".to_owned(),
                 launch.kernel_command_line(&options.cmdline)?,
             ]);
-            extend_network_arguments(&mut command, &options, &rules);
+            options.network.extend_arguments(&mut command, &rules);
             if let Some(report) = &options.outcome_report {
                 command.extend(["--microvm-report".to_owned(), path_text(report)]);
             }
@@ -732,7 +597,7 @@ pub(super) fn run(root: Option<&str>, options: Options) -> Result {
 /// Windows, where Python cannot interrupt its wait, waits for it to exit; either way the command
 /// ends as interrupted, also when OpenVMM exited first, since Python's wait raises
 /// `KeyboardInterrupt` once Ctrl-C arrives.
-fn run_openvmm(command: &[String]) -> Result<i32> {
+pub(super) fn run_openvmm(command: &[String]) -> Result<i32> {
     let mut child = Command::new(&command[0])
         .args(&command[1..])
         .spawn()

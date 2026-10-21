@@ -3,12 +3,15 @@
 //! ```text
 //! nvx-rs [-h] [--root PATH] [--prog PROG] artifacts
 //! nvx-rs [-h] [--root PATH] [--prog PROG] egress compile PATH
+//! nvx-rs [-h] [--root PATH] [--prog PROG] run [OPTIONS]
 //! nvx-rs [-h] [--root PATH] [--prog PROG] sandbox [run|provision|start|exec|stop|deprovision] [OPTIONS]
 //! ```
 //!
 //! - `artifacts` prints the paths of the artifacts that `nvx.py` runs as JSON.
 //! - `egress compile PATH` compiles an egress policy file of `--network-egress-policy-file` and
 //!   prints its native rules as JSON.
+//! - `run` is `nvx.py run`: the same options, checks, outputs, and exit statuses, and it boots or
+//!   restores a microVM on the terminal.
 //! - `sandbox` is `nvx.py sandbox`: the same options, outputs, exit statuses, outcome reports,
 //!   and state directories.
 //!
@@ -27,7 +30,9 @@ mod args;
 mod artifacts;
 mod deadline;
 mod egress;
+mod network;
 mod output;
+mod run;
 mod sandbox;
 mod session;
 
@@ -41,20 +46,21 @@ use crate::host::python::fs::os_error_message;
 /// The name of the program in usage messages unless `--prog` names another.
 const PROGRAM: &str = "nvx-rs";
 /// The commands, in the order in which usage messages list them.
-const COMMANDS: [&str; 3] = ["artifacts", "egress", "sandbox"];
+const COMMANDS: [&str; 4] = ["artifacts", "egress", "run", "sandbox"];
 /// The usage and help of the top-level parser.
 const SYNTAX: Syntax = Syntax {
     command: "",
     optionals: &["[-h]", "[--root PATH]", "[--prog PROG]"],
-    positionals: &["{artifacts,egress,sandbox} ..."],
+    positionals: &["{artifacts,egress,run,sandbox} ..."],
     help: "\
 Run the NVX steps that nvx.py delegates: artifact lookup, egress policy
-compilation, and sandboxes.
+compilation, microVM runs, and sandboxes.
 
 positional arguments:
-  {artifacts,egress,sandbox}
+  {artifacts,egress,run,sandbox}
     artifacts           print the paths of the NVX artifacts as JSON
     egress              compile egress policy files
+    run                 run an OpenVMM microVM
     sandbox             run or manage workloads over EROFS layers and private
                         ext4 scratch
 
@@ -216,6 +222,8 @@ enum Command {
     Artifacts,
     /// `egress compile PATH`.
     EgressCompile(String),
+    /// `run ...`.
+    Run(Box<run::Options>),
     /// `sandbox ...`.
     Sandbox(Box<sandbox::Options>),
 }
@@ -274,6 +282,10 @@ fn run(arguments: &[OsString]) -> Result {
             let (path, unrecognized) = egress::parse(rest, &program)?;
             (Command::EgressCompile(path), unrecognized)
         }
+        "run" => {
+            let (options, unrecognized) = run::parse(rest, &program)?;
+            (Command::Run(Box::new(options)), unrecognized)
+        }
         "sandbox" => {
             let (options, unrecognized) = sandbox::parse(rest, &program)?;
             (Command::Sandbox(Box::new(options)), unrecognized)
@@ -296,6 +308,7 @@ fn run(arguments: &[OsString]) -> Result {
     match command {
         Command::Artifacts => artifacts::run(root),
         Command::EgressCompile(path) => egress::run(&path),
+        Command::Run(options) => run::run(root, *options),
         Command::Sandbox(options) => sandbox::run(root, *options),
     }
 }

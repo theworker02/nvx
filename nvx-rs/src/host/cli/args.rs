@@ -29,7 +29,7 @@
 //! [`Syntax`] holds what a parser's usage and help show, and formats its usage for any program
 //! name as `argparse` wraps it for 80 columns.
 
-use crate::host::python::builtins::{decimal_value, repr};
+use crate::host::python::builtins::{Int, decimal_value, repr};
 
 /// The width of usage and help: 80 columns, less the margin of 2 that `argparse` keeps, as for a
 /// pipe, whose `shutil.get_terminal_size()` is 80 columns.
@@ -538,6 +538,23 @@ pub(crate) fn invalid_choice(value: &str, choices: &[&str]) -> String {
 /// such as `invalid int value: 'x'`.
 pub(crate) fn invalid_value(type_name: &str, value: &str) -> String {
     format!("invalid {type_name} value: {}", repr(value))
+}
+
+/// Returns the choice that `value` names among `choices`, as `argparse` checks `choices`.
+pub(crate) fn choice(
+    value: &str,
+    choices: &[&'static str],
+) -> std::result::Result<&'static str, String> {
+    choices
+        .iter()
+        .find(|choice| **choice == value)
+        .copied()
+        .ok_or_else(|| invalid_choice(value, choices))
+}
+
+/// Returns `int(value)` for an option of `type=int`.
+pub(crate) fn integer(value: &str) -> std::result::Result<Int, String> {
+    Int::parse(value).map_err(|_| invalid_value("int", value))
 }
 
 #[cfg(test)]

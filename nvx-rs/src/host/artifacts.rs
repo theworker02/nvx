@@ -376,6 +376,17 @@ impl Guest {
         }
     }
 
+    /// Returns the RAM, in MiB, with which `nvx.py run` boots the guest without `--memory-mib`:
+    /// the `default_memory_mib` of its descriptor in `scripts/nvx_tools/guests.py`, which
+    /// `nvx.py test-microvm` also uses, and which a test of `nvx.py` pins to the golden scenarios
+    /// of `nvx-rs run`.
+    pub const fn default_memory_mib(self) -> u32 {
+        match self {
+            Self::Alpine => 128,
+            Self::Ubuntu | Self::AzureLinux => 512,
+        }
+    }
+
     /// Returns the file name of the package manifest of the guest's initramfs.
     pub fn package_manifest_name(self) -> String {
         format!("{}{PACKAGE_MANIFEST_SUFFIX}", self.initramfs_name())
@@ -894,6 +905,7 @@ mod tests {
             Some("ubuntu-distro.erofs.manifest.json")
         );
         assert_eq!(Guest::Alpine.distro_manifest_name(), None);
+        assert_eq!(Guest::ALL.map(Guest::default_memory_mib), [128, 512, 512]);
     }
 
     #[test]

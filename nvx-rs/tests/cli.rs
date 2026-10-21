@@ -3,12 +3,14 @@
 //!
 //! The retired `scripts/nvx_rs_fixtures.py` recorded the scenarios from the Python
 //! implementation of `nvx.py sandbox`, which `nvx-rs` replaced, and from the Python functions
-//! behind `nvx-rs egress compile` and `nvx-rs artifacts`, with `nvx-fake-openvmm` as OpenVMM, in a
-//! section for POSIX hosts and one for Windows. Each scenario runs here in a fresh root, with
-//! `nvx-rs --root ROOT`, and every step must exit with the recorded status, print the recorded
-//! output, and leave the recorded files, after the root, process IDs, and random identifiers are
-//! replaced with the placeholders that the script used. Now that `nvx.py sandbox` runs `nvx-rs`,
-//! the recordings are its reference: a deliberate change of behavior updates them by hand.
+//! behind `nvx-rs egress compile` and `nvx-rs artifacts`, and `scripts/nvx_rs_run_fixtures.py`
+//! records those whose names start with `run, ` from the Python implementation of `nvx.py run`,
+//! with `nvx-fake-openvmm` as OpenVMM, in a section for POSIX hosts and one for Windows. Each
+//! scenario runs here in a fresh root, with `nvx-rs --root ROOT`, and every step must exit with
+//! the recorded status, print the recorded output, and leave the recorded files, after the root,
+//! process IDs, and random identifiers are replaced with the placeholders that the scripts use.
+//! Now that `nvx.py sandbox` runs `nvx-rs`, the recordings of its scenarios are its reference: a
+//! deliberate change of behavior updates them by hand.
 #![cfg(all(
     feature = "cli",
     feature = "testing",
@@ -607,7 +609,8 @@ fn a_relative_openvmm_override_is_relative_to_the_working_directory() {
 
 #[test]
 fn top_level_usage_errors_exit_with_status_2() {
-    let usage = "usage: nvx-rs [-h] [--root PATH] [--prog PROG] {artifacts,egress,sandbox} ...\n";
+    let usage = "usage: nvx-rs [-h] [--root PATH] [--prog PROG]\n              \
+                 {artifacts,egress,run,sandbox} ...\n";
     for (arguments, message) in [
         (
             &[][..],
@@ -620,7 +623,7 @@ fn top_level_usage_errors_exit_with_status_2() {
         (
             &["build"][..],
             "nvx-rs: error: argument command: invalid choice: 'build' (choose from \
-             'artifacts', 'egress', 'sandbox')\n",
+             'artifacts', 'egress', 'run', 'sandbox')\n",
         ),
     ] {
         let output = Command::new(NVX_RS).args(arguments).output().unwrap();
@@ -707,9 +710,10 @@ fn messages_name_the_program_that_prog_names() {
     assert_eq!(output.status.code(), Some(2));
     assert_eq!(
         text(&output.stderr),
-        "usage: nvx.py [-h] [--root PATH] [--prog PROG] {artifacts,egress,sandbox} ...\n\
+        "usage: nvx.py [-h] [--root PATH] [--prog PROG]\n              \
+         {artifacts,egress,run,sandbox} ...\n\
          nvx.py: error: argument command: invalid choice: 'build' (choose from 'artifacts', \
-         'egress', 'sandbox')\n"
+         'egress', 'run', 'sandbox')\n"
     );
     let output = Command::new(NVX_RS)
         .args(["--prog", "nvx.py", "artifacts", "--help"])
@@ -717,6 +721,183 @@ fn messages_name_the_program_that_prog_names() {
         .unwrap();
     assert!(output.status.success());
     assert!(text(&output.stdout).starts_with("usage: nvx.py artifacts [-h]\n\nPrint the paths"));
+}
+
+/// The CPU-profile guidance that `nvx.py` passes to `nvx-rs run` on a host whose CPU no built-in
+/// profile serves, in two lines.
+const GUIDANCE: &str = "nvx: no built-in CPU profile serves this host's CPU\nnvx: see doc/usage.md";
+
+/// Returns the arguments of `nvx-rs run` with the guidance of `nvx.py`, then `arguments`.
+fn guided_run(arguments: &[&str]) -> Vec<String> {
+    ["run", &format!("--cold-boot-guidance={GUIDANCE}")]
+        .into_iter()
+        .chain(arguments.iter().copied())
+        .map(str::to_owned)
+        .collect()
+}
+
+#[test]
+fn run_prints_its_guidance_only_after_a_failed_cold_boot() {
+    let root = populated_root();
+    let snapshot = root.path.join("snapshot");
+    fs::create_dir(&snapshot).unwrap();
+    let snapshot = snapshot.to_str().unwrap();
+    // OpenVMM fails the cold boot, or refuses its command line with the status of a usage error;
+    // the guidance follows what OpenVMM printed.
+    for (arguments, status, stderr) in [
+        (&["--cmdline", "fake_exit_status=1"][..], 1, ""),
+        (&["--cmdline", "fake_exit_status=2"][..], 2, ""),
+        (
+            &["--host-loopback-forward", "tcp:8080:80"][..],
+            2,
+            "openvmm: --host-loopback-forward requires explicit --host-loopback allow\n",
+        ),
+    ] {
+        let output = run(&root, &guided_run(arguments));
+        assert_eq!(output.status.code(), Some(status), "{arguments:?}");
+        assert_eq!(
+            text(&output.stderr),
+            format!("{stderr}{GUIDANCE}\n"),
+            "{arguments:?}"
+        );
+        assert!(text(&output.stdout).starts_with(">> "), "{arguments:?}");
+    }
+    // A cold boot that succeeds, a dry run, the restores that fail, the options that nvx-rs
+    // refuses, its usage errors, and the help print none.
+    for (arguments, status) in [
+        (&[][..], 0),
+        (&["--cmdline", "fake_exit_status=1", "--dry-run"][..], 0),
+        (
+            &[
+                "--restore-snapshot",
+                snapshot,
+                "--cmdline",
+                "fake_exit_status=1",
+            ][..],
+            1,
+        ),
+        (&["--restore-snapshot", "missing"][..], 1),
+        (&["--net", "10.0.0.2/24"][..], 1),
+        (
+            &["--mount", "/data", "--cmdline", "fake_exit_status=1"][..],
+            1,
+        ),
+        (&["--processors", "3"][..], 2),
+        (&["--bogus"][..], 2),
+        (&["--help"][..], 0),
+    ] {
+        let output = run(&root, &guided_run(arguments));
+        assert_eq!(output.status.code(), Some(status), "{arguments:?}");
+        assert!(
+            !text(&output.stderr).contains(GUIDANCE),
+            "{arguments:?}: {}",
+            text(&output.stderr)
+        );
+        assert!(
+            !text(&output.stdout).contains("cold-boot-guidance"),
+            "{arguments:?}"
+        );
+    }
+    // Nor does OpenVMM that does not start.
+    let environment = BTreeMap::from([(
+        "NVX_OPENVMM".to_owned(),
+        root.path.join("single.txt").to_str().unwrap().to_owned(),
+    )]);
+    let output = nvx_rs(&root, &guided_run(&[]), &environment);
+    assert_eq!(output.status.code(), Some(1));
+    let stderr = text(&output.stderr);
+    assert!(
+        stderr.starts_with("error: ") && !stderr.contains(GUIDANCE),
+        "{stderr}"
+    );
+}
+
+#[test]
+fn run_boots_each_guest_with_its_default_memory() {
+    let root = populated_root();
+    for guest in nvx::host::artifacts::Guest::ALL {
+        let initramfs = root.path.join("build").join(guest.initramfs_name());
+        fs::write(initramfs, "initramfs\n").unwrap();
+        let arguments = ["run", "--guest", guest.name(), "--dry-run"].map(str::to_owned);
+        let output = run(&root, &arguments);
+        assert!(output.status.success(), "{}", text(&output.stderr));
+        let memory = format!(" --memory {}M ", guest.default_memory_mib());
+        assert!(text(&output.stdout).contains(&memory), "{guest}");
+    }
+}
+
+#[test]
+fn run_shares_relative_roots_with_absolute_policy_paths() {
+    // nvx-rs run passes the host path of each share as given, so the children of an aggregate may
+    // be relative to the working directory, while their policy paths must be absolute: OpenVMM
+    // attributes each one to the share whose root contains it once it has resolved both.
+    let root = populated_root();
+    let path = |parts: &[&str]| {
+        parts
+            .iter()
+            .fold(root.path.clone(), |path, part| path.join(part))
+            .to_str()
+            .unwrap()
+            .to_owned()
+    };
+    let arguments = [
+        "run".to_owned(),
+        "--mount".to_owned(),
+        "/data,share,rw".to_owned(),
+        "--mount".to_owned(),
+        "/other,share2".to_owned(),
+        "--mount-deny".to_owned(),
+        path(&["share", "hidden"]),
+        "--mount-allow".to_owned(),
+        path(&["share", "hidden", "shown"]),
+    ];
+    let output = run(&root, &arguments);
+    assert!(output.status.success(), "{}", text(&output.stderr));
+    let stdout = text(&output.stdout);
+    let child = nvx::host::sandbox::mount::aggregate_child_name(0, "/data");
+    assert!(
+        stdout.contains(&format!(" --mount-child {child},share,rw ")),
+        "{stdout}"
+    );
+    assert!(
+        stdout.ends_with("\nopenvmm: booted the microVM\n"),
+        "{stdout}"
+    );
+}
+
+#[test]
+fn run_messages_name_the_program_that_prog_names() {
+    let output = Command::new(NVX_RS)
+        .args(["--prog", "nvx.py", "run", "--processors", "3"])
+        .output()
+        .unwrap();
+    assert_eq!(output.status.code(), Some(2));
+    let stderr = text(&output.stderr);
+    assert!(
+        stderr.starts_with(
+            "usage: nvx.py run [-h] [--guest {alpine,ubuntu,azurelinux}]\n                  \
+             [--hypervisor {auto,whp,kvm,mshv}] [--machine {microvm}]\n"
+        ),
+        "{stderr}"
+    );
+    assert!(
+        stderr.ends_with(
+            "                  [--restore-ready-path RESTORE_READY_PATH] [--dry-run]\n\
+             nvx.py run: error: argument --processors: invalid choice: '3' (choose from '1', \
+             '2', '4', '8')\n"
+        ),
+        "{stderr}"
+    );
+    // The help shows the options of nvx.py run, without the guidance that nvx.py passes.
+    let output = Command::new(NVX_RS)
+        .args(["--prog", "nvx.py", "run", "--help"])
+        .output()
+        .unwrap();
+    assert!(output.status.success());
+    let stdout = text(&output.stdout);
+    assert!(stdout.starts_with("usage: nvx.py run [-h]"), "{stdout}");
+    assert!(stdout.ends_with("\n  --dry-run\n"), "{stdout}");
+    assert!(!stdout.contains("guidance"), "{stdout}");
 }
 
 #[cfg(unix)]
@@ -802,6 +983,24 @@ mod interrupts {
         assert_eq!(text(&output.stderr), "Interrupted\n");
         assert!(text(&output.stdout).starts_with(">> "));
         assert!(elapsed < Duration::from_secs(10), "{elapsed:?}");
+    }
+
+    #[test]
+    fn interrupting_a_cold_boot_ends_it_without_guidance() {
+        // The fake OpenVMM delays its boot, which Ctrl-C ends, alone or with OpenVMM, as the
+        // terminal's does; nvx-rs run then exits as interrupted, without the guidance that it
+        // prints after a failed cold boot.
+        let root = populated_root();
+        let arguments = guided_run(&["--cmdline", "fake_boot_delay_ms=60000"]);
+        let started = root.path.join("build").join("fake-openvmm-.json");
+        for group in [false, true] {
+            let _ = fs::remove_file(&started);
+            let (output, elapsed) = interrupt(&root, &arguments, &started, group);
+            assert_eq!(output.status.code(), Some(130), "{group}");
+            assert_eq!(text(&output.stderr), "Interrupted\n", "{group}");
+            assert!(text(&output.stdout).starts_with(">> "), "{group}");
+            assert!(elapsed < Duration::from_secs(10), "{elapsed:?}");
+        }
     }
 
     #[test]

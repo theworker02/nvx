@@ -157,6 +157,7 @@ nvx/
 |   |-- nvx-hosts.example.json   Template for the ignored .nvx-hosts.json
 |   |-- nvx.py                   Supported command-line entry point
 |   |-- nvx_adversarial_executor.py Restricted adversarial executor entry point
+|   |-- nvx_rs_run_fixtures.py   Golden scenarios of `nvx.py run` for nvx-rs, recorded from its Python implementation
 |   |-- publish_development_release.py Development release publisher run by CI
 |   `-- test_*.py                Python tooling unit tests
 |-- tests/                       Tests that build on the repository's crates from outside them
