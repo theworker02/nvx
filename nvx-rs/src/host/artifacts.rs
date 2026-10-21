@@ -53,6 +53,11 @@ const BUNDLED_DIR: Option<&str> = option_env!("NVX_BUNDLED_ARTIFACTS_DIR");
 ///
 /// Every path is used as given. Resolve relative paths with [`absolute`] before a VM runs them,
 /// and check that the files exist, because nothing here does.
+///
+/// Artifacts located in a release or a repository checkout keep its [`ArtifactDir`], whose
+/// install metadata names their [`runtime_identity`](Self::runtime_identity). Artifacts named by
+/// path, through [`new`](Self::new) or the explicit variables of [`discover`](Self::discover),
+/// have none: their caller supplies the runtime identity of a launch.
 #[derive(Debug, Clone, PartialEq, Eq)]
 #[non_exhaustive]
 pub struct Artifacts {
@@ -62,6 +67,8 @@ pub struct Artifacts {
     pub kernel: PathBuf,
     /// The NVX Alpine initramfs (`initramfs.cpio.gz`): the guest userland and its control agent.
     pub initrd: PathBuf,
+    /// The release or checkout in which the artifacts were located, if they were.
+    directory: Option<ArtifactDir>,
 }
 
 impl Artifacts {
@@ -75,7 +82,58 @@ impl Artifacts {
             openvmm: openvmm.into(),
             kernel: kernel.into(),
             initrd: initrd.into(),
+            directory: None,
         }
+    }
+
+    /// Returns the sandbox artifacts of `directory`, which they remember.
+    fn located(directory: &ArtifactDir) -> Self {
+        Self {
+            directory: Some(directory.clone()),
+            ..Self::new(
+                directory.openvmm(),
+                directory.kernel(),
+                directory.initramfs(Guest::Alpine),
+            )
+        }
+    }
+
+    /// Returns the release or repository checkout in which the artifacts were located, or `None`
+    /// for artifacts named by path.
+    pub fn artifact_dir(&self) -> Option<&ArtifactDir> {
+        self.directory.as_ref()
+    }
+
+    /// Returns the runtime identity of these artifacts, which the install metadata of the release
+    /// or checkout in which they were located names, as [`ArtifactDir::runtime_identity`] reads
+    /// it, without reading or hashing an artifact.
+    ///
+    /// Fails with [`ErrorKind::Unavailable`](crate::ErrorKind::Unavailable) for artifacts named by
+    /// path, whose caller supplies their identity instead, for artifacts whose paths no longer
+    /// name the ones of their directory, and as [`ArtifactDir::runtime_identity`] fails.
+    pub fn runtime_identity(&self) -> Result<RuntimeIdentity> {
+        let Some(directory) = &self.directory else {
+            return Err(Error::unavailable(
+                "the artifacts are named by path, so no install metadata identifies them: locate \
+                 them in an NVX release or repository checkout, or supply their runtime identity",
+            ));
+        };
+        let located = Self::located(directory);
+        for (path, expected, description) in [
+            (&self.openvmm, &located.openvmm, "OpenVMM executable"),
+            (&self.kernel, &located.kernel, "guest kernel"),
+            (&self.initrd, &located.initrd, "guest initramfs"),
+        ] {
+            if path != expected {
+                return Err(Error::unavailable(format!(
+                    "the {description} {} is not the one of {}, whose install metadata \
+                     identifies the artifacts",
+                    path.display(),
+                    directory.root().display()
+                )));
+            }
+        }
+        directory.runtime_identity()
     }
 
     /// Checks that this host can run NVX VMs and that the three files exist.
@@ -135,11 +193,7 @@ impl Artifacts {
     /// [`check_manifest`] does.
     fn from_artifact_dir(directory: &ArtifactDir) -> Result<Self> {
         check_manifest(&directory.root().join(MANIFEST_NAME))?;
-        Ok(Self::new(
-            directory.openvmm(),
-            directory.kernel(),
-            directory.initramfs(Guest::Alpine),
-        ))
+        Ok(Self::located(directory))
     }
 
     /// Returns the artifacts staged by the build script, if the crate was built with the
@@ -573,16 +627,17 @@ impl ArtifactDir {
     }
 
     /// Returns the artifacts of a sandbox, as `nvx.py sandbox run` and `nvx.py sandbox start`
-    /// require them: the OpenVMM executable, the kernel, and the Alpine initramfs, in that order.
+    /// require them: the OpenVMM executable, the kernel, and the Alpine initramfs, in that order,
+    /// located in this directory.
     ///
     /// Fails as [`require_file`] does for the first one that is not a regular file, with the
     /// messages of [`require_openvmm`](Self::require_openvmm) and
     /// [`require_kernel`](Self::require_kernel), or `initramfs not found: PATH`.
     pub fn sandbox_artifacts(&self) -> Result<Artifacts> {
-        let openvmm = self.require_openvmm()?;
-        let kernel = self.require_kernel()?;
-        let initrd = required(self.initramfs(Guest::Alpine), "initramfs")?;
-        Ok(Artifacts::new(openvmm, kernel, initrd))
+        self.require_openvmm()?;
+        self.require_kernel()?;
+        required(self.initramfs(Guest::Alpine), "initramfs")?;
+        Ok(Artifacts::located(self))
     }
 
     /// Returns the paths of every artifact, for a caller to show or record.
@@ -1188,13 +1243,19 @@ mod tests {
             artifacts.initramfs(Guest::Alpine),
         );
         create(artifacts.initramfs(Guest::Alpine));
+        let located = artifacts.sandbox_artifacts().unwrap();
         assert_eq!(
-            artifacts.sandbox_artifacts().unwrap(),
-            Artifacts::new(
-                artifacts.openvmm(),
-                artifacts.kernel(),
-                artifacts.initramfs(Guest::Alpine)
-            )
+            [&located.openvmm, &located.kernel, &located.initrd],
+            [
+                &artifacts.openvmm(),
+                &artifacts.kernel(),
+                &artifacts.initramfs(Guest::Alpine)
+            ]
+        );
+        assert_eq!(located.artifact_dir(), Some(&artifacts));
+        assert_eq!(
+            located,
+            Artifacts::from_repo_layout(directory.path()).unwrap()
         );
 
         assert_eq!(artifacts.require_openvmm().unwrap(), artifacts.openvmm());
@@ -1395,6 +1456,52 @@ mod tests {
         fs::remove_file(&list).unwrap();
         fails(
             "is missing, so the runtime cannot be identified: the release is incomplete".to_owned(),
+        );
+    }
+
+    #[test]
+    fn located_artifacts_have_the_identity_of_their_directory() {
+        let directory = tempfile::tempdir().unwrap();
+        release(directory.path());
+        let digests = ["4", "5", "6"].map(|digit| digit.repeat(64));
+        let text: String = [
+            (&digests[0], format!("bin/{}", openvmm_executable())),
+            (&digests[1], "guest/vmlinux".to_owned()),
+            (&digests[2], "guest/initramfs.cpio.gz".to_owned()),
+        ]
+        .iter()
+        .map(|(digest, name)| format!("{digest}  {name}\n"))
+        .collect();
+        fs::write(directory.path().join(CHECKSUMS_NAME), text).unwrap();
+        let located = Artifacts::from_dir(directory.path()).unwrap();
+        assert_eq!(
+            located.artifact_dir(),
+            Some(&ArtifactDir::release(directory.path()).unwrap())
+        );
+        assert_eq!(located.runtime_identity().unwrap(), identity_of(&digests));
+
+        // Artifacts named by path have no install metadata.
+        let named = Artifacts::new(&located.openvmm, &located.kernel, &located.initrd);
+        assert_eq!(named.artifact_dir(), None);
+        let error = named.runtime_identity().unwrap_err();
+        assert_eq!(error.kind(), ErrorKind::Unavailable);
+        assert!(
+            error.message().contains("supply their runtime identity"),
+            "{error}"
+        );
+        // Nor does an artifact that replaced one of the directory's.
+        let mut replaced = located.clone();
+        replaced.kernel = directory.path().join("vmlinux");
+        let error = replaced.runtime_identity().unwrap_err();
+        assert_eq!(error.kind(), ErrorKind::Unavailable);
+        assert_eq!(
+            error.message(),
+            format!(
+                "the guest kernel {} is not the one of {}, whose install metadata identifies the \
+                 artifacts",
+                replaced.kernel.display(),
+                located.artifact_dir().unwrap().root().display()
+            )
         );
     }
 
